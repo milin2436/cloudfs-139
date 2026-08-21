@@ -1,0 +1,30 @@
+# 编译产物
+cloudfs
+*.exe
+*.test
+*.out
+
+# 临时文件
+*.tmp
+*.bak
+*.swp
+*~
+
+# IDE
+.idea/
+.vscode/
+*.iml
+*.ipr
+*.iws
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Go
+vendor/
+go.sum.tmp
+
+# 配置（含 token，不要提交）
+.cloudfs.json
