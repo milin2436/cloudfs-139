@@ -14,6 +14,7 @@
 - **文件操作**：列表、下载、上传、创建目录、删除、移动、复制、重命名
 - **空间查询**：查看已用 / 剩余 / 总容量
 - **账户信息**：获取当前登录账号（手机号）、昵称、VIP 状态
+- **分享外链**：创建公开 / 加提取码 / 带有效期的分享链接，列出与撤销分享
 - **多账号支持**：一个配置文件中管理多个 139 网盘账号
 - **离线 Token 刷新**：默认离线刷新，更安全
 - **Go SDK**：可直接在 Go 项目中 import 使用
@@ -186,9 +187,44 @@ cloudfs --config /path/to/config.json ls /
 | `cloudfs rename <path> <new-name>` | 重命名 |
 | `cloudfs space [mount]` | 查看空间用量 |
 | `cloudfs whoami [mount]` | 查看账户信息 |
+| `cloudfs share <path> [--password] [--days N] [--name N] [--to p1,p2]` | 创建分享链接（**会把文件公开出去**） |
+| `cloudfs shares [--type sent\|received] [--json]` | 列出我发出的 / 收到的分享 |
+| `cloudfs unshare <linkID> [-f]` | 撤销分享（默认二次确认） |
 | `cloudfs init [--driver X] [--write]` | 打印/写入示例配置 |
 
 全局选项：`-c, --config <path>` 指定配置文件路径（默认 `~/.cloudfs.json`）。
+
+### 分享
+
+```bash
+# 永久链接，无提取码（最宽松）
+cloudfs share /yun139/相册/2026.jpg
+
+# 加提取码，7 天有效；提取码由 139 生成，和链接一起打印
+cloudfs share /yun139/相册 --password --days 7 --name 我的相册
+
+# 好友专享（pubType 2），viewers 传手机号
+cloudfs share /yun139/相册 --to 13800138000,13900139000
+
+# 机器可读输出
+cloudfs share /yun139/相册 --json
+```
+
+`--days` 只接受 `0`（永久）、`1`、`7` —— 这是 139 服务端给出的全部选项，传别的值
+会在本地直接报错，不会打到服务端。
+
+```bash
+cloudfs shares                      # 我发出的分享
+cloudfs shares --type received      # 别人发给我的
+cloudfs unshare 2ygb7jkiFM640       # 撤销（要输 y）
+cloudfs unshare 2ygb7jkiFM640 -f    # 跳过确认
+```
+
+> **分享需要个人账号**。外链服务挂在 139 的 personalCloud 编排网关上，只有
+> `personal_new` / `personal` 能用；家庭云、群组云会直接报
+> `sharing is not supported for account type ...`。
+> 注意这和 `Type: "share"` 是两回事 —— 后者是"消费"别人发来的分享（走 AES 分享网关），
+> 前者是"自己创建"分享。
 
 ---
 
@@ -237,6 +273,24 @@ func main() {
     // 账户信息
     info, _ := client.UserInfo(ctx, "/yun139")
     fmt.Printf("Account: %s, Nickname: %s\n", info.Account, info.Nickname)
+
+    // 分享：这会生成一个任何人都能拿 URL 下载的链接，调用方必须自己决定要不要调
+    res, err := client.Share(ctx, "/yun139/我的文件/photo.jpg", cloudfs.ShareOptions{
+        Encrypted:   true, // 加提取码，码由 139 生成
+        ExpiresDays: 7,    // 0=永久, 1, 7
+        Name:        "相册",
+    })
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("link=%s code=%s\n", res.URL, res.Passwd)
+
+    // 列出并撤销
+    page, _ := client.ListShares(ctx, "/yun139", cloudfs.ShareKindSent, 1, 100)
+    for _, it := range page.Items {
+        fmt.Printf("%s  %s  %s\n", it.LinkID, it.Name, it.URL)
+    }
+    client.CancelShare(ctx, "/yun139", res.LinkID)
 }
 ```
 
@@ -251,6 +305,11 @@ func main() {
 | `family` | 家庭云 | 旧 API + 相册 AES 加密 |
 | `group` | 群组云 | 旧 API + 相册 AES 加密 |
 | `share` | 分享链接 | AES 加密分享 API |
+
+> **`Type: "share"` 不等于"能分享"**。`share` 类型是用来**读取别人发来的分享**
+> （AES 加密分享网关）。**自己创建分享链接**走的是完全不同的 personalCloud
+> 编排网关，需要 `personal_new` / `personal`；家庭云、群组云创建分享会被驱动
+> 直接拒绝。见上文 [分享](#分享)。
 
 ---
 

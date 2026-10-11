@@ -2,8 +2,9 @@
 
 > 本文是**代码地图**：给"要在这个仓库里加一个功能"的人用的。
 > 使用者文档见 [README.md](README.md)，移植与踩坑史见 [DEV.md](DEV.md)。
-> 全文基于 2026-10-12 的 `main`，共 125 个 Go 文件。使用层（`sdk/` + `cmd/`）为
+> 全文基于 2026-10-12 的 `main`，共 129 个 Go 文件。使用层（`sdk/` + `cmd/`）为
 > 2026-10-12 重建 —— 原代码随磁盘损坏丢失，见 §0 与 DEV.md §1。
+> 2026-10-12 另加分享（外链）功能三层实现，见 §6.9 与 DEV.md §3.5 / §4.15。
 > 所有引用格式为 `文件:行号`，可直接跳转。
 
 ---
@@ -14,8 +15,8 @@
 
 | 曾经缺失 | 现在 |
 |---|---|
-| `sdk/cloudfs/`（SDK） | ✅ `doc.go` `json.go` `config.go` `types.go` `client.go` `userinfo.go` + `config_test.go` `dsn_test.go` |
-| `cmd/cloudfs/`（CLI，11 个子命令） | ✅ `main.go` `cmds.go` `util.go` |
+| `sdk/cloudfs/`（SDK） | ✅ `doc.go` `json.go` `config.go` `types.go` `client.go` `userinfo.go` `share.go` + `config_test.go` `dsn_test.go` |
+| `cmd/cloudfs/`（CLI，14 个子命令） | ✅ `main.go` `cmds.go` `share.go` `util.go` |
 | `db.Init` / `base.InitClient` 无调用方 | ✅ 由 `Client.onceInit` 调用 |
 | `cloudfso/op` 零调用方 | ✅ 全部 op 方法都有入口（除归档相关） |
 | `*_test.go` 数量为 0 | ✅ `config_test.go` 12 个 + `dsn_test.go` 1 个，共 13 个用例 |
@@ -28,10 +29,14 @@
 
 1. **真机联调已做（2026-10-12）**，账号 `17144995673`。已跑通并验证：
    `whoami`、`ls`（含嵌套目录与虚拟根）、`mkdir`、`mv`、`rename`、`cp`、`rm`
-   （含确认交互）、`Stat`、`Download`（前 256KiB，验证 link 解析与流式管道）。
+   （含确认交互）、`Stat`、`Download`（前 256KiB，验证 link 解析与流式管道）、
+   **分享全套**（`share` 无码永久 / 加码 1 天各一次 → `shares` 列出 → `unshare` 撤销，
+   见 §6.9）。
    **上传被服务端以 `00010012 资源配额不足` 拒绝** —— 账号存储已满，
    请求体本身正确（`size`/`contentHash`/`parentFileId` 全部匹配本地文件），
    所以是账号状态而非代码问题。`space` 需要 `user_domain_id`，见 DEV.md §3.3。
+   ⚠️ 因为上传不可用，分享的真机验证只能拿**空目录**做（新建 → 分享 → 撤销 → 删除），
+   还没验证过"分享一个真实文件"和"分享一个非空目录"。
 2. **归档功能全部返回 `UnknownArchiveFormat`**。`archive/tool.RegisterTool` 全仓库
    0 个调用方，zip/rar/7z 解压不可用。
 3. **5 张 OpenList 多租户表是无用残留**（见 §9）。
@@ -59,7 +64,7 @@
 ├────────────────────────────────────────────────────────────┤
 │  driver  driver.Driver = Meta + Reader（接口契约）          │  ← 契约层
 ├────────────────────────────────────────────────────────────┤
-│  drivers/yun139  Yun139（1167+1765+454+37 行）             │  ← 自研核心
+│  drivers/yun139  Yun139（1167+1765+454+403+37 行）        │  ← 自研核心
 │      5 种账号类型 × 9 个操作 × 10 个 HTTP 通道              │
 ├────────────────────────────────────────────────────────────┤
 │  base（resty） net（HTTP 服务/分片下载器） stream（流抽象）  │
@@ -81,7 +86,9 @@
 
 | 包 | 行数量级 | 职责 | 139 场景是否真用 |
 |---|---|---|---|
-| `drivers/yun139` | 3423 | 139 云盘驱动，5 账号类型 | ★★★ 核心 |
+| `sdk/cloudfs` | 1725 | 使用层 SDK：配置、路径解析、`Client.*` 包装（含 `share.go` 217 行分享） | ★★★ |
+| `cmd/cloudfs` | 766 | CLI：14 个子命令（含 `share.go` 256 行分享三件套） | ★★★ |
+| `drivers/yun139` | 3826 | 139 云盘驱动，5 账号类型 | ★★★ 核心 |
 | `cloudfso/op` | ~4100 | 操作层 facade，SDK/CLI 唯一入口 | ★★★ |
 | `cloudfso/driver` | ~430 | Driver 接口契约 + Config + 进度/限速 | ★★★ |
 | `cloudfso/model` | ~3500 | Obj / Link / FileStreamer / Storage / User 等领域模型 | ★★★ |
@@ -291,7 +298,7 @@ drivers/yun139/meta.go:31  init() → op.RegisterDriver(func() driver.Driver { .
 
 ---
 
-## 6. 驱动核心：`drivers/yun139`（3423 行）
+## 6. 驱动核心：`drivers/yun139`（3826 行）
 
 | 文件 | 行 | 内容 |
 |---|---|---|
@@ -299,6 +306,7 @@ drivers/yun139/meta.go:31  init() → op.RegisterDriver(func() driver.Driver { .
 | `types.go` | 454 | 所有 API 请求/响应结构体 + 5 个账号类型常量（:7-13） |
 | `driver.go` | 1167 | `Yun139` 结构体 + 全部 Driver 方法实现 |
 | `util.go` | 1765 | HTTP 通道 + 签名 + 加密 + 登录 + Token 刷新 |
+| `share.go` | 403 | 外链（outlink）分享：创建/列表/撤销 + `jsonInt64`。见 §6.9 |
 
 ### 6.1 `Addition` 配置（`meta.go:8-23`）
 
@@ -455,6 +463,56 @@ func (d *Yun139) groupGetLink(contentId string, path string) (string, error) {
 - share 下载 URL 三级回退：`extInfo.cdnDownloadUrl` > `redrUrl` > `downloadUrl`（:802-810）。
 - share 无 `account` 时只给 `PresentURL`，否则报错（:780-785）。
 - share 可无 Authorization：`Init` 跳过 refreshToken（`driver.go:48`），`shareHeaders` 无 auth 时不设 `Authorization`（:518-520）→ **只能预览不能下载**。
+
+### 6.9 外链（outlink）分享网关 —— 与 §6.8 完全不同的一套
+
+⚠️ **§6.8 讲的是"读别人发来的分享"，本节讲的是"自己创建分享"。两套网关、两套
+加密策略、两套账号要求，代码上也没有任何共享。**
+
+实现：`drivers/yun139/share.go`（驱动）→ `sdk/cloudfs/share.go`（SDK）→
+`cmd/cloudfs/share.go`（CLI）。踩坑与错误码表见 DEV.md §3.5 / §4.15。
+
+| | §6.8 share 账号（消费） | §6.9 outlink（创建） |
+|---|---|---|
+| host | personal 网关 | `https://yun.139.com/orchestration/personalCloud-rebuild/outlink/v1.0` |
+| 传输 | `hcy-cool-flag: 1` + AES-256-CBC | **明文 JSON，不加任何头** |
+| 账号 | `Type: "share"` | 仅 `personal_new` / `personal`（`checkShareSupport()` 本地拒绝其它类型） |
+
+**三个端点**（body 都是 `{actionReq: {...}}` 单键包裹）：
+
+| 方法 | 路径 | body 的 key |
+|---|---|---|
+| `CreateOutLink` | `/getOutLink` | `getOutLinkReq` |
+| `ListOutLinks` | `/getOutLinkList` | `getOutLinkLstReq` |
+| `DeleteOutLinks` | `/delOutLink` | `delOutLinkReq` |
+
+**为什么不加 `hcy-cool-flag`**：那是 `shareHeaders()` 给 §6.8 的 AES 网关用的，
+加了会强制响应变成 AES base64 blob，请求体就得用 32 字节硬编码 key 加密。
+outlink 网关不带这个头就是明文 JSON —— **加这个头只会把简单问题变成密码学问题**。
+签名永远算在**明文 body** 上。
+
+**复用方式**：直接调驱动已有的 `newRequest()`（`util.go:823`，mcloud-sign 那套）
+打到一个不同的 URL 即可，不用新建 resty 客户端。
+注意 `newRequest` 在 `success: false` 时会丢弃 body 只返回 `errors.New(e.Message)`，
+所以分享功能的错误细节只能靠 CLI/SDK 的返回信息判断，看不到原始 JSON。
+
+**必须记住的四条**（一条都会导致只有真机才报错的问题，详见 DEV.md §4.15）：
+
+1. `commonAccountInfo` 要放在 **action 对象内部**，放顶层 → `1010010015 鉴权失效`。
+   这是唯一用**手机号**（不是 Cookie Authorization）标识账号的地方。
+2. body key 与路径拼写不一致：`getOutLinkLstReq`（`Lst`）↔ `/getOutLinkList`（`List`）。
+3. `qryType` 没有默认值：`1` = 我发出的，`2` = 发给我的，`0` → `1010000500`。
+   列表还必须带 `srt: 0, srtDr: 0`。
+4. 139 的数字字段类型不稳定（`count` 是字符串），用 `jsonInt64` 同时吃两种。
+
+**限制**：单次分享 ≤ 50 个对象，撤销也 ≤ 50；`expires` 只能是 0 / 1 / 7 天；
+提取码由服务端生成（没有"自定义码"参数），CLI 的 `--password` 是布尔开关。
+`openCount` 字段**不是**有效分享数（一条活着的分享返回 0），别拿它当 active 用。
+
+**使用层接入方式**：走"食谱 8 路径 2"（类型断言），本地接口
+`outlinkShareable` 定义在 `sdk/cloudfs/share.go:80`，和 `userinfo.go` 的
+`userInfoProvider` 完全同一个模式 —— 框架没有分享接口，所以只能断言，
+不能做成通用能力。
 
 ---
 
@@ -667,6 +725,10 @@ func Truncate(ctx context.Context, storage driver.Driver, path string, size int6
 
 1. **通用通道（零改动）**：`op.Other(ctx, storage, model.FsOtherArgs{Path, Method, Data})`（`fs.go:284`）→ `driver.Other`。yun139 已实现（`driver.go:1066`）。
 2. **类型安全通道**：`storage, actualPath, _ := op.GetStorageAndActualPath(path)` → `if x, ok := storage.(SomeIface); ok {...}`。与 op 层内部写法完全一致（`fs.go:288`、`:772`、`:783`）。
+   **仓库里已有两个使用者**：`sdk/cloudfs/userinfo.go`（账户信息，本地接口
+   `userInfoProvider`）和 `sdk/cloudfs/share.go`（分享，本地接口
+   `outlinkShareable`，见 §6.9）。**加一个不属于 op 层的能力（分享、搜索、回收站）
+   就用这条路** —— 别为了一个功能去改 `cloudfso/op` 的公共接口。
 3. **元信息暴露（不需要实例）**：`op.GetDriverInfoMap()` / `GetDriverNames()` / `GetDriver(name)`。
 
 ### 食谱 9 — 给下载加 Range / 断点续传

@@ -193,6 +193,33 @@ SDK 用 `NormalizeDriverName` 把两种拼写都接受，因此旧配置不用�
 `driver.go` 中 List/Get/Link/Put/MakeDir/Move/Rename/Copy/Remove 都有
 `if d.isPersonalNew() { ... } else if d.isFamily() { ... }` 等多分支。
 
+### 3.5 分享（外链）网关 —— 和 `Type: "share"` 是两套东西
+
+**这是本项目最容易搞混的一点**，所以单独写一节。
+
+| | `Type: "share"` 账号 | `cloudfs share` 创建的分享 |
+|---|---|---|
+| 方向 | 读取**别人**发来的分享 | **自己**创建分享链接 |
+| 网关 | AES 加密分享网关（`sharePost()`） | `yun.139.com/orchestration/personalCloud-rebuild/outlink/v1.0` |
+| 传输 | AES-256-CBC 加解密 | **明文 JSON，完全不加密** |
+| 账号要求 | `Type: "share"` | 仅 `personal_new` / `personal` |
+
+实现见 `drivers/yun139/share.go`（驱动层）、`sdk/cloudfs/share.go`（SDK）、
+`cmd/cloudfs/share.go`（CLI）。三个方法：`CreateOutLink` / `ListOutLinks` /
+`DeleteOutLinks`。
+
+**为什么这里不发 `hcy-cool-flag`**：这个头是 `shareHeaders()` 给 AES 分享网关
+用的，它会强制服务端把响应改成 AES-256-CBC base64 blob，于是请求体也必须用
+32 字节硬编码 key（`UqEZkrjCKfa02pP6jntzFmkzOz86zHUC`，来自前端
+`app.ff91d73b.js`）加密。那条路能走通，但纯属多余的移动部件 —— 不带这个头的
+同一个 outlink 调用直接返回明文 JSON。所以 `share.go` 里的 outlink 调用刻意
+不加这个头。**加上去就等于把简单问题变成密码学问题。**
+
+**签名永远算在明文 body 上**。即使 body 被加密，签名也必须是明文版本，因为
+前端在 `da()` 里先 `getNewSign(...e.data...)`、之后拦截器才 `e.data = Dt(e.data)`。
+
+完整契约、验证过程与踩坑见 §4.15。
+
 ---
 
 ## 4. 踩过的坑（修改时必读）
@@ -456,6 +483,75 @@ Path: joinPath(mount, o.GetPath())   // 恒等于 mount！
 列出 `rel` 目录时，子项路径是 `mount + "/" + rel + "/" + name`。
 SDK 里对应 `childPath()` + `toFile(mount, rel, o)`，回归测试 `TestToFilePaths`。
 
+### 4.15 ⚠️ 分享接口：`commonAccountInfo` 必须放在 action 对象**里面**
+
+加分享功能时踩的坑，全部来自 outlink 网关，一次都不会在编译期报错，只有真机
+调用才暴露。
+
+**网关与路径**：`https://yun.139.com/orchestration/personalCloud-rebuild/outlink/v1.0`
+
+复用驱动已有的 `newRequest()`（mcloud-sign 那套）打到一个不同的 host 即可，
+不需要新客户端。三个接口：
+
+| 操作 | 路径 | body 的 key |
+|---|---|---|
+| 创建 | `/getOutLink` | `getOutLinkReq` |
+| 列表 | `/getOutLinkList` | `getOutLinkLstReq` |
+| 撤销 | `/delOutLink` | `delOutLinkReq` |
+
+**坑一：`commonAccountInfo` 要嵌在 action 对象内部。** 放顶层会得到
+`1010010015 鉴权失效`。正确形状：
+
+```json
+{"getOutLinkReq": {"commonAccountInfo": {"account": "17144995673", "accountType": 1}, "caIDLst": [...]}}
+```
+
+这里也是唯一用**手机号**而不是 Cookie Authorization 标识账号的地方。
+（前端代码本身并不发这个字段 —— 是 axios 拦截器从数组 `sa` 注入的，见
+`app.js:149056`，所以从前端源码抄 body 一定会漏。）
+
+**坑二：body 的 key 和路径不拼写一致。** `getOutLinkLstReq`（`Lst`）对应
+`/getOutLinkList`（`List`）。照抄一个就会 404。
+
+**坑三：`qryType` 没有默认值。** 列表接口 `qryType: 1` = 我发出的分享，`2` =
+别人发给我的；传 `0` 会得到 `1010000500`。所以 SDK 层强制要求调用方二选一，
+不替它猜。列表还必须有 `srt: 0, srtDr: 0`，漏了会得到"外链的排序方式不能为空"。
+
+**坑四：139 的数字字段类型不稳定。** 同一个逻辑数字在有的接口返回 `123`、
+有的返回 `"123"`（列表接口的 `count` 就是字符串）。代码里用 `jsonInt64`
+自定义 `UnmarshalJSON` 同时吃两种，解析失败时**留零值而不是让整个分页失败**。
+
+**坑五：不要给 CLI 暴露"自定义提取码"。** 前端创建分享的请求里只有 `encrypt`
+标志，没有码字段 —— 码是服务端生成的。第一版 SDK 按直觉写了
+`ShareOptions.Password string`，结果它永远不传输，纯属误导 API 的用户。
+后来改成 `Encrypted bool`，和实际行为一致。
+
+**坑六：`openCount` 不是"有效分享数"。** 一条未过期、可用、未失效的分享，
+`openCount` 返回 `0`。字段照实暴露了，但注释里写明它不可信，CLI 表格也不再用
+它当"active"显示。
+
+**校验过的服务端错误码**（用来判断是账号问题还是代码问题）：
+
+| 现象 | 码 / 信息 | 含义 |
+|---|---|---|
+| 文件 ID 不存在 | `200000400` 用户没有权限操作文件/目录记录/记录已被删除 | 正常：说明请求真的到了校验环节 |
+| ID 列表为空 | `9146` 非法参数为空 | 参数问题 |
+| `pubType: 2` 但没 viewer | 好友分享时，好友列表不能为空 | 参数问题 |
+| 链接 ID 不存在 | 外链不存在/外链被分享者取消 | 撤销接口正常报错 |
+| 分享名含敏感词 | `9470` | 服务端内容审核 |
+| 家庭云/群组云调分享 | `sharing is not supported for account type ...` | 驱动层本地拒绝，没发请求 |
+
+### 4.16 探针的取舍：能删就删
+
+`drivers/yun139/share_probe_test.go`（`//go:build probe`）在**调研阶段**用：
+把网关的 header 列表、签名、body 全复刻一份，用来把上表的错误码一个一个
+钉死。**契约钉死之后它就删掉了**，原因是它把同一套 header/body 契约抄了一遍，
+必然和 `share.go` 的真实实现漂移 —— 而且它比生产代码更容易看起来"还在工作"，
+其实测的是旧的假设。
+
+如果之后要再加一个类似的功能，调研阶段照写探针没问题，但**功能落地后记得删**，
+真机验证直接跑 CLI 就好（§5.2）。别为了留个"冒烟测试"而留一份平行实现。
+
 ---
 
 ## 5. 构建与测试
@@ -488,7 +584,13 @@ go build -o /tmp/cloudfs ./cmd/cloudfs/
 ```
 
 已验证通过的操作（真实账号）：`whoami`、`ls`、`mkdir`、`mv`、`rename`、`cp`、
-`rm`、`Stat`、`Download`。
+`rm`、`Stat`、`Download`，以及分享全套：`share`（无码永久 / 加码 1 天，各一次）、
+`shares`（发出 + 收到）、`unshare`（含确认交互与 `-f`）。分享的验证走的是
+自建空目录 `cloudfs-share-probe` → 分享 → 撤销 → 删除，全程只暴露一个空目录。
+
+**分享是唯一有外部影响的命令。** 生成出来的 URL 任何拿到它的人都能下载文件，
+所以测试时只拿自建目录做实验，创建后**立刻 `unshare`**，别留着。README 里也
+把这点写进了命令表格。
 
 三个坑，都是真机才暴露的：
 

@@ -62,6 +62,9 @@ func newRootCmd() *cobra.Command {
 		newRenameCmd(),
 		newSpaceCmd(),
 		newWhoamiCmd(),
+		newShareCmd(),
+		newSharesCmd(),
+		newUnshareCmd(),
 		newInitCmd(),
 	)
 	return root
