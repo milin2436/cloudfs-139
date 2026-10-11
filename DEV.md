@@ -2,19 +2,40 @@
 
 > 这份文档面向**修改者**：说明项目结构、关键实现路径、踩过的坑、构建与测试方式。
 > README.md 面向使用者，本文面向维护者。
+>
+> 要「加一个新功能」先读 [INDEX.md](INDEX.md) —— 全量包索引、扩展点、11 条扩展食谱与缺陷清单。
 
 ---
 
 ## 1. 项目概要
 
 - **模块名**：`github.com/milin2436/cloudfs-139`
-- **Go 版本**：1.25.0（开发机 Go 1.27.0，位于 `/home/super/bin/go/bin/go`）
+- **Go 版本**：`go.mod` 声明 `go 1.25.0`；当前开发机工具链 **go1.26.5**（`/home/super/bin/go/bin/go`）
+  - ⚠️ 早期文档写的 Go 1.27.0 已经不存在了。`cloudfso/cache/weak_cache.go` 用了
+    Go 1.27 才有的标准库 `weak` 包，因此用 `//go:build go1.27` 隔离（见 §4.7）
 - **来源**：从 [OpenList 4.2.5](https://github.com/OpenListTeam/OpenList) 移植
-  - OpenList 源码：`/home/super/Downloads/code/OpenList-4.2.5`
+  - ⚠️ OpenList 源码目录 `/home/super/Downloads/code/OpenList-4.2.5` **已随磁盘损坏丢失**，
+    需要对照上游时请重新 clone
   - 移植方式：将 OpenList 的 `internal/` 和 `drivers/base/` 复制到 `cloudfso/`，
     将所有 import 从 `github.com/OpenListTeam/OpenList/v4/...` 改为
     `github.com/milin2436/cloudfs-139/...`
 - **用途**：独立的中国移动 139 网盘 SDK + CLI，不依赖 OpenList 主项目
+
+### 一次磁盘损坏与重写（2026-10）
+
+存放原始可构建代码的磁盘损坏。排查结论：仓库只有 1 个 commit（`ad08926`），
+没有其它分支、空 stash、`git fsck --unreachable` 也为空，机器上也没有第二份副本 ——
+**`sdk/` 和 `cmd/` 完全丢失，无法恢复**。
+
+框架层（`cloudfso/` + `drivers/yun139/`）是完整的，靠 `go build ./cloudfso/...`
+验证过可以编译，所以只重写了使用层：
+
+| 丢失内容 | 恢复方式 |
+|---------|---------|
+| `sdk/cloudfs/{doc,json,config,client,types,userinfo}.go` + `config_test.go` | 按 README + DEV.md 契约重写 |
+| `cmd/cloudfs/{main,cmds,util}.go` | 按 README 命令表重写 |
+| `GOPROXY` 设置 | 默认 proxy.golang.org 在本机不可达，必须 `export GOPROXY=https://goproxy.cn,direct` |
+| 测试配置 `/tmp/139-personal-test.json` | 含真实 token，未恢复；`~/.cloudfs.json` 后来配好了，联调已跑通（见 §5.2） |
 
 ### 为什么用 `cloudfso/` 而不是 `internal/`？
 
@@ -63,16 +84,21 @@ cloudfs-139/
 │       └── util.go         # HTTP 请求 + 登录/加密/Token 刷新（1766 行）
 │
 ├── sdk/
-│   └── cloudfs/            # ★ SDK 层
-│       ├── doc.go          # 包文档 + 配置示例
-│       ├── json.go         # JSON marshal/unmarshal 工具（防无限递归）
-│       ├── config.go       # Config/StorageCfg/JSON 类型、Load/Marshal、ResolveConfigPath
-│       └── client.go       # ★ SDK 核心（587 行）
+│   └── cloudfs/            # ★ SDK 层（public 包名 cloudfs）
+│       ├── doc.go          # 包文档：挂载路径语义 + 配置示例
+│       ├── json.go         # marshalValue/unmarshalValue（防 MarshalJSON 无限递归）
+│       ├── config.go       # Config/StorageCfg/JSON、Validate/Load/Marshal/SampleConfig
+│       ├── types.go        # File/Space/UserInfo（SDK 自有结构，带小写 json tag）
+│       ├── client.go       # ★ Client：init 7 步、路径解析、全部文件操作
+│       ├── userinfo.go     # UserInfo：唯一的驱动特化点（接口断言到 yun139）
+│       ├── config_test.go  # 配置校验 / JSON 往返 / 路径解析 / addition 缺省 / 路径拼装
+│       └── dsn_test.go     # sqliteDSN 回归测试：必须真内存、且跨连接池共享
 │
 └── cmd/
     └── cloudfs/            # ★ CLI
-        ├── main.go         # Cobra 入口，注册 11 个子命令
-        └── cmds.go         # 子命令实现
+        ├── main.go         # Cobra 入口，注册 11 个子命令 + -c/--config + -v
+        ├── cmds.go         # 子命令实现（ls/get/put/mkdir/rm/mv/cp/rename/space/whoami/init）
+        └── util.go         # PrintWriter、newClient、humanSize、atMost、confirm
 ```
 
 ---
@@ -84,19 +110,31 @@ cloudfs-139/
 入口：`sdk/cloudfs/client.go` → `NewClientFromFile(ctx, path)`
 
 ```
-NewClientFromFile
-  └─ LoadConfigFromFile        # 解析 JSON 配置
-  └─ NewClient
-      └─ onceInit()
-          ├─ conf.Conf = &conf.Config{Database:{Type:"sqlite3"}}   # ①
-          ├─ gorm.Open(sqlite.Open("file::memory:..."))            # ② 内存 SQLite
-          ├─ db.Init(d)                                            # ③ AutoMigrate
-          ├─ base.InitClient()                                     # ④ 初始化 resty 客户端
-          └─ 遍历 storages
-              └─ op.RegisterDriver(cfg.Driver, &driver{})          # ⑤ 注册驱动
-              └─ op.MustSaveDriverStorage(storage)                 # ⑥ 写入 SQLite
-              └─ driver.Init(ctx)                                  # ⑦ 驱动自己的初始化
+NewClientFromFile(ctx, path)
+  ├─ LoadConfigFromFile        # 读文件 → 解析 JSON → Validate()
+  └─ NewClient(cfg)
+      └─ ensureInit(ctx)       # sync.Once；第一个操作时触发，也可显式 c.Init(ctx)
+          └─ onceInit(ctx)
+              ├─ ① conf.Conf == nil 时设置 {Database:{Type:"sqlite3"}, TempDir:os.TempDir()}
+              ├─ ② gorm.Open(sqlite.Open("file:cloudfs?mode=memory&cache=shared&..."))
+              │      # ⚠️ mode=memory 是必需的，缺了会写出磁盘文件，见 §4.12
+              ├─ ③ db.Init(d)                     # 设全局 gorm + AutoMigrate 8 张表
+              ├─ ④ base.InitClient()              # 初始化 resty 客户端
+              └─ ⑤ 遍历 storages
+                  └─ op.CreateStorage(ctx, model.Storage{MountPath, Driver, Addition})
+                      ├─ GetDriver(name)          # 名字不对在这里报 "no driver named: xxx"
+                      ├─ db.CreateStorage         # 写入内存 SQLite
+                      └─ initStorage              # ⑥ 反序列化 Addition → ⑦ driver.Init(ctx)
 ```
+
+**驱动注册不在这里**。`client.go` 顶部空导入 `drivers/yun139`，它的 `init()`
+调用 `op.RegisterDriver(func() driver.Driver {...})`，名字取自
+`driver.Config{Name: "139Yun"}`。本文早期版本写的 `op.RegisterDriver(cfg.Driver,
+&driver{})` 是错误签名（`RegisterDriver` 只收一个 constructor，driver 名读自
+`Config().Name`），已按实际实现更正。
+
+**注册名与文档拼写的差异**：驱动注册名是 `139Yun`，README 早期写作 `yun139`。
+SDK 用 `NormalizeDriverName` 把两种拼写都接受，因此旧配置不用改。
 
 **⑦ driver.Init 做了什么**（`drivers/yun139/driver.go`）：
 1. 解析 `Authorization` token → 解码账户手机号
@@ -110,6 +148,22 @@ NewClientFromFile
 `cloudfs Client` 接收的路径如 `/yun139/photos/a.jpg`，
 由 `resolvePath()` 拆分为 `(mountPath="/yun139", relativePath="photos/a.jpg")`，
 再通过 `driverForMount()` 找到对应的 Storage，交给 `op.*` 函数。
+
+三点关键设计：
+
+1. **最长前缀匹配**。同时配了 `/yun139` 和 `/yun139/backup` 时，
+   `/yun139/backup/x.tar` 必须归给后者，所以遍历所有 mount 取最长匹配。
+   用 `utils.IsSubPath`（带 `/` 分隔符边界）而不是 `strings.HasPrefix`，
+   否则 `/yun139X` 会误配到 `/yun139`。
+2. **解析只读 config，不读运行时 map**。`resolvePath` / `mountPath` /
+   `validateMount` 全部查 `c.cfg.Storages`，唯一的运行时查询点是
+   `driverForMount`。这样解析是确定性的、可以在 `Init` 之前单测。
+   （早期版本把 `default_mount` 的有效性判断挂在 `op.HasStorage` 上，
+   导致框架未启动时静默退回第一个 storage，已被测试抓出来修正。）
+3. **`/` 是虚拟根**。`List(ctx, "/")` 不走 `resolvePath`，直接返回配置的
+   mount 列表，这样 `cloudfs ls /` 和 README 的示例都成立。
+4. **`..` 先被规范化**。`FixAndCleanPath` 内含 `path.Clean`，
+   所以 `/yun139/../family` 等价于 `/family` —— 驱动永远看不到 `..`。
 
 ### 3.3 UserInfo 获取链路
 
@@ -199,6 +253,209 @@ Args: func(cmd *cobra.Command, args []string) error {
 
 无 GCC 环境必须用 glebarez 版本。
 
+另外注意调用方式：`sqlite.Open(dsn)` 返回的是 `gorm.Dialector`，不是 `*gorm.DB`，
+所以必须写 `gorm.Open(sqlite.Open(dsn), &gorm.Config{})` 而不是直接用它。
+
+### 4.7 `weak_cache.go` 用 build tag 隔离
+
+`cloudfso/cache/weak_cache.go` 导入标准库 `weak` 包（`weak.Pointer` / `weak.Make`），
+该包 **Go 1.27 才引入**。当前工具链是 go1.26.5，直接编译会报找不到该模块。
+
+处理方式是在文件头加 `//go:build go1.27`，而不是删文件：
+`WeakCacheMap` 全仓库 0 个调用方，隔离后无任何行为影响；
+将来换回 1.27+ 工具链时它会自动重新参与编译。
+
+### 4.8 复合字面量里 `}` 后面不能换行再接 `,`
+
+```go
+// 编译不过：unexpected newline in composite literal
+{"ok", &Config{
+        Storages: []StorageCfg{{...}},
+        DefaultMount: "/yun139"}
+     , ""},
+```
+
+表驱动测试里很容易写出这种格式（`}` 结束内层字面量、换行后再补逗号）。
+**用显式字段名就绕开了**，也更可读：
+
+```go
+{
+    name:    "ok",
+    cfg:     &Config{Storages: []StorageCfg{{...}}, DefaultMount: "/yun139"},
+    wantErr: "",
+},
+```
+
+### 4.9 `model.Object` 没有 json tag
+
+`cloudfso/model.Object` 的字段全部无 tag，直接 `json.Marshal` 会输出
+`{"Name":...,"Size":...,"Modified":...}`（大写字段名）。
+所以 SDK 在 `types.go` 里自己定义了 `File` / `Space` / `UserInfo` 并带小写 tag，
+`toFile()` 做映射 —— **不要图省事直接返回 `model.Obj`**。
+
+### 4.10 上传必须自己构造 `stream.FileStream`
+
+`stream.FileStream` 没有公开的构造器，`size` 字段是私有的。
+`GetSize()` 的逻辑是 `if f.size > 0 { return f.size }`，否则回退到嵌入的
+`Obj.GetSize()`。因此传文件大小只能走嵌入的 `model.Object`：
+
+```go
+file := &stream.FileStream{
+    Ctx:      ctx,
+    Obj:      &model.Object{Name: st.Name(), Size: st.Size(), Modified: st.ModTime(), Ctime: st.ModTime()},
+    Reader:   f,
+    Mimetype: utils.GetMimeType(st.Name()),
+}
+return op.Put(ctx, d, rel, file, up)
+```
+
+`*model.Object` 满足 `model.Obj` 接口（8 个方法），但不满足 `FileStreamer`，
+这没问题 —— 因为 `Obj` 接口本身不要求 `FileStreamer`。
+
+### 4.11 ⚠️ `.gitignore` 的裸 `cloudfs` 会把源码目录整个排除
+
+这是本次磁盘损坏之外最值得记的一条。`.gitignore` 原来的编译产物规则是：
+
+```
+# 编译产物
+cloudfs
+```
+
+gitignore 里**不带 `/` 的模式匹配任意层级的同名文件*和目录***。所以这条规则
+除了忽略根目录那个 27M 的二进制，还把源码目录 `sdk/cloudfs/` 和 `cmd/cloudfs/`
+**整个排除在版本控制之外**：
+
+```bash
+$ git check-ignore -v sdk/cloudfs/client.go
+.gitignore:2:cloudfs	sdk/cloudfs/client.go     # 被忽略！
+
+$ git status --porcelain
+ M DEV.md                          # sdk/ 和 cmd/ 压根不会出现在列表里
+```
+
+`git status` 连 `?? sdk/` 都不会显示，所以这个问题极其隐蔽 ——
+**这很可能就是原来那份「可构建代码」从没进过 git 的原因。**
+
+修法是把模式锚定到仓库根：
+
+```
+/cloudfs          # 只匹配根目录的二进制
+/cloudfs.exe
+```
+
+副作用：在子目录里编译出的同名二进制不再被忽略。因此约定
+`go build -o /tmp/cloudfs ./cmd/cloudfs/`（写到 /tmp，不要写进仓库）。
+`*.exe` / `*.test` / `*.out` 仍然全局生效。
+
+**排查手法**：改完 `.gitignore` 后用 `git check-ignore -v <path>` 逐条验证，
+不要只信 `git status` —— 被忽略的文件在那里是完全不可见的。
+
+### 4.12 ⚠️ `file::memory:...` **不是**内存数据库，它会在 cwd 写出磁盘文件
+
+重写时发现的最隐蔽的一个。原 DSN 是这样的：
+
+```go
+const sqliteDSN = "file::memory:cloudfs?cache=shared&_pragma=busy_timeout(5000)"
+```
+
+注释写的是"内存数据库"，读起来也很像内存数据库。但它**会在进程当前目录创建一个
+真实文件，文件名就叫 `:memory:cloudfs`**：
+
+```bash
+$ ls -la
+-rw-r--r-- 1 super super 65536 Oct 12 02:08 :memory:cloudfs   # ← 仓库根目录里！
+```
+
+原因：SQLite 只把**精确等于** `:memory:` 的这个名字当作匿名内存库，其它任何名字
+一律按普通文件名处理。`file::memory:cloudfs` 的路径部分是 `:memory:cloudfs`，
+不等于 `:memory:`，于是成了文件名。
+
+两个后果，第二个更麻烦：
+
+1. **凭据泄露到任意 cwd**。`storages.addition` 这一列存的是 Addition JSON，里面
+   带 139 的 `Authorization` token（配置里给了 `Username/Password` 时也带密码）。
+   它在哪个目录运行 CLI，就在哪个目录落一个未加密的 sqlite 文件。
+2. **第二次运行直接崩**。文件跨进程留存，第二次 `cloudfs ls` 在同一个目录跑时，
+   `CreateStorage` 插入同一个 `mount_path` 撞上唯一约束：
+
+   ```
+   error: storage "/yun139" (yun139): failed create storage in database:
+    constraint failed: UNIQUE constraint failed: storages.mount_path (2067)
+   ```
+
+   注意这个报错发生在**驱动初始化之前**，所以问题看起来像是配置重复，
+   完全指向不了数据库。
+
+**正确写法**：
+
+```go
+const sqliteDSN = "file:cloudfs?mode=memory&cache=shared&_pragma=busy_timeout(5000)"
+```
+
+`mode=memory` + `cache=shared` 才是"有名字但仍在内存里、且多连接共享"的组合。
+`_pragma=` 这个参数 modernc.org/sqlite 是支持的（mattn 的驱动也支持）。
+
+**顺带一个相反的坑**：裸 `:memory:` 也不要随便用。它对 database/sql 的**每个
+连接各建一个私有库**，gorm 连接池里开第二个连接就看不到第一个建好的表
+（`no like table: storages`）。实测对比：
+
+| DSN | 跨连接池共享 | cwd 落文件 |
+|-----|:---:|:---:|
+| `file::memory:cloudfs?cache=shared&...` | ✅ | ❌ **会落** |
+| `file:cloudfs?mode=memory&cache=shared&...` | ✅ | ✅ 不落 |
+| `:memory:` | ❌ 每连接一个库 | ✅ 不落 |
+
+回归测试 `TestSQLiteDSNIsInMemoryAndShared`（`sdk/cloudfs/dsn_test.go`）锁死了这两点：
+断言第二个连接池能看到第一个插入的行，并断言运行前后当前目录的文件列表不变。
+把 DSN 改回 `file::memory:cloudfs` 它会立刻失败并点名漏出来的文件名。
+
+**教训**：URI 型 DSN 的"看起来像 X"不等于"是 X"。任何带 `file:` 前缀的 DSN
+都要实测一次——开库、插一行、从另一个连接池读回来、再看一眼 cwd。
+
+### 4.13 ⚠️ 结构体 tag 里的 `default:"..."` **不会**被 JSON 反序列化应用
+
+`drivers/yun139/meta.go` 的 Addition 里写着：
+
+```go
+Type string `json:"type" type:"select" options:"personal_new,family,group,personal,share" default:"personal_new"`
+```
+
+`default:"personal_new"` 只是给 OpenList **Web 表单渲染器**看的提示。
+手写在配置文件里的 Addition 如果不写 `"Type"`，`utils.Json.Unmarshal` 之后
+`Addition.Type` 就是空串，`driver.Init` 的 `switch d.Addition.Type` 直接掉进
+`default` 返回 `errs.NotImplement`，用户看到一句毫无指向的 `not implement`：
+
+```
+error: storage "/yun139" (yun139): failed init storage ...: not implement
+```
+
+SDK 在 `client.go` 的 `normalizeAddition` 里补上这个缺省，并且**只在值缺失或
+为空时补**——拼错（比如 `personla_new`）不会被悄悄纠正，仍然会报 NotImplement。
+回归测试 `TestNormalizeAddition`。
+
+同类陷阱：`driver.Config` / `Addition` 的 tag 里所有非标准库字段
+（`type:`、`options:`、`default:`、`secret:`、`required:`、`help:`）
+都只是 Web UI 元数据，Go 代码里没有任何机制会自动生效。
+
+### 4.14 ⚠️ `op.List` 返回的对象 **没有** Path
+
+`op.List` 和 yun139 的 driver 都不会给列表结果填 `model.Object.Path`
+（只有合成的根目录对象会填 `Path: "/"`）。所以图省事写
+
+```go
+Path: joinPath(mount, o.GetPath())   // 恒等于 mount！
+```
+
+会得到所有条目的 `path` 都塌缩成挂载点：
+
+```json
+[{"name":"x02.hdy","path":"/yun139"}, {"name":"001.hdy","path":"/yun139"}]
+```
+
+列表结果里只有 `Name` 可用，全路径必须由调用方自己拼：
+列出 `rel` 目录时，子项路径是 `mount + "/" + rel + "/" + name`。
+SDK 里对应 `childPath()` + `toFile(mount, rel, o)`，回归测试 `TestToFilePaths`。
+
 ---
 
 ## 5. 构建与测试
@@ -206,47 +463,86 @@ Args: func(cmd *cobra.Command, args []string) error {
 ### 5.1 构建
 
 ```bash
-cd /home/super/work/cloudfs-139
+cd /home/super/gowork/cloudfs-139
 
-# 整理依赖
-GOROOT=/home/super/bin/go go mod tidy
+# ⚠️ 必须先设：默认的 proxy.golang.org 在本机不可达，会一直 i/o timeout
+export GOPROXY=https://goproxy.cn,direct
 
-# 编译 CLI
-GOROOT=/home/super/bin/go go build -o /tmp/cloudfs ./cmd/cloudfs/
-
-# 编译 SDK 包
-GOROOT=/home/super/bin/go go build ./sdk/cloudfs/
+go mod tidy              # 应该无输出、不改任何文件
+go build ./...           # 框架 + SDK + CLI 全量编译
+go vet ./...
+go test ./...            # 见 5.3
+go build -o /tmp/cloudfs ./cmd/cloudfs/
 ```
 
 ### 5.2 端到端测试
 
-已有测试配置 `/tmp/139-personal-test.json`，包含一个 personal_new 账号的 Authorization：
+用真实的 `~/.cloudfs.json`（含 Authorization）可以直接跑：
 
 ```bash
-/tmp/cloudfs --config /tmp/139-personal-test.json whoami
-# → {"account":"...","username":"...","total_space":0,...}
-
-/tmp/cloudfs --config /tmp/139-personal-test.json ls /
-/tmp/cloudfs --config /tmp/139-personal-test.json space
+go build -o /tmp/cloudfs ./cmd/cloudfs/
+/tmp/cloudfs whoami                 # 默认读 ~/.cloudfs.json，不带 -c
+/tmp/cloudfs ls /                   # 虚拟根，列出所有挂载点
+/tmp/cloudfs ls /yun139             # 挂载点内容
+/tmp/cloudfs -v ls /yun139          # -v 看驱动层 debug 日志
 ```
 
-### 5.3 调试模式
+已验证通过的操作（真实账号）：`whoami`、`ls`、`mkdir`、`mv`、`rename`、`cp`、
+`rm`、`Stat`、`Download`。
+
+三个坑，都是真机才暴露的：
+
+- **`addition.type` 不填会报 `not implement`**。见 §4.13，SDK 已补缺省。
+- **上传可能报 `00010012 资源配额不足`**。这是账号存储满了，不是代码问题。
+  判断方法：`-v` 看 `/hcy/file/create` 的请求体，`size` / `contentHash` /
+  `parentFileId` 都对就只是配额。
+- **`space` 必须配 `user_domain_id`**（Cookie 里的 `ud_id`），否则驱动返回
+  `not implement`。SDK 已转成可操作报错。
+
+`-v` 会把 Authorization token 以明文打进 debug 日志（驱动自己打的，
+`storage &{... Addition:{Authorization:*** 排查完关掉 `-v`，
+不要把带 token 的日志提交或贴出来。
+
+测试写路径时**先 `mkdir` 一个自己的目录**，在里面做 `mv`/`rename`/`cp`/`rm`，
+跑完 `rm -f` 清掉，不要拿账号里已有的文件做实验。
+
+### 5.3 测试
+
+```bash
+go test ./sdk/...          # SDK 配置校验 / JSON 往返 / 路径解析 / DSN 回归，13 个用例
+go test -race ./sdk/...    # 并发安全
+go test -v -run TestResolvePath ./sdk/...   # 单个用例
+```
+
+路径解析、配置校验、JSON 往返都可以离线测（不触发 `ensureInit`）。
+需要真实 token 的只有驱动初始化之后的操作；用空 token 跑一次可以确认
+整条启动链路是通的，报错应停在驱动自己的参数校验：
+
+```bash
+/tmp/cloudfs -c <空 token 配置> ls /
+# → error: storage "/yun139" (yun139): ... authorization is empty and username/password is not provided
+```
+
+### 5.4 调试模式
 
 `ls --output raw` 会捕获 HTTP 请求/响应（通过 `base.EnableHTTPCapture()`），
-输出原始 HTTP 交换内容，方便排查 API 问题。
+输出原始 HTTP 交换内容，方便排查 API 问题。`ls` 还支持 `--output json`。
+抓包必须在请求发起前开启，SDK 里对应的三个函数是
+`cloudfs.EnableHTTPCapture` / `DisableHTTPCapture` / `FormatHTTPCaptures`。
 
 ---
 
 ## 6. 环境变量与开发机
 
-| 变量 | 值 |
+| 项 | 值 |
 |------|----|
-| GOROOT | `/home/super/bin/go` |
-| Go 版本 | 1.27.0 |
-| GOPROXY | 默认（goproxy.cn / proxy.golang.org） |
+| GOROOT | `/home/super/bin/go`（`go` 在 `/home/super/bin/go/bin/go`） |
+| Go 版本 | **go1.26.5**（早期文档写的 1.27.0 已不存在） |
+| GOPROXY | **必须** `https://goproxy.cn,direct`；默认的 proxy.golang.org 在本机 i/o timeout |
 | OS | Linux amd64 |
-| 原始 OpenList | `/home/super/Downloads/code/OpenList-4.2.5` |
-| 测试配置 | `/tmp/139-personal-test.json` |
+| CGO | 无 gcc，SQLite 只能用纯 Go 的 glebarez 版本 |
+| 原始 OpenList | ❌ 已丢失（`/home/super/Downloads/code/OpenList-4.2.5`），需重新 clone |
+| 测试配置 | ✅ `~/.cloudfs.json`（账号 `17144995673`，个人网盘）；旧的 `/tmp/139-personal-test.json` 已丢失 |
 
 ---
 

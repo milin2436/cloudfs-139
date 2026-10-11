@@ -62,7 +62,7 @@ cloudfs init --driver yun139 --write
   "storages": [
     {
       "mount_path": "/yun139",
-      "driver": "yun139",
+      "driver": "139Yun",
       "addition": {
         "Authorization": "your-auth-token-here"
       }
@@ -112,12 +112,12 @@ cloudfs --config /path/to/config.json ls /
   "storages": [
     {
       "mount_path": "/yun139",
-      "driver": "yun139",
+      "driver": "139Yun",
       "addition": {
         "Authorization": "...",
         "Username": "13800138000",
         "Password": "your-password",
-        "RootID": "",
+        "RootFolderID": "",
         "Type": "personal_new"
       }
     }
@@ -126,6 +126,14 @@ cloudfs --config /path/to/config.json ls /
 }
 ```
 
+> **`driver` 取值**：驱动实际注册的名字是 `139Yun`（见 `drivers/yun139/meta.go` 的
+> `driver.Config.Name`）。`yun139` 作为别名同样可用，两种拼写都能启动。
+
+> **字段名大小写不敏感**：`addition` 用 jsoniter 的
+> `ConfigCompatibleWithStandardLibrary` 解析，`Authorization` / `authorization`
+> 等价。但键名必须真的存在 —— 例如自定义根目录的键是 `RootFolderID`，写 `RootID`
+> 会被静默忽略。
+
 ### Addition 字段说明
 
 | 字段 | 必填 | 说明 |
@@ -133,9 +141,9 @@ cloudfs --config /path/to/config.json ls /
 | `Authorization` | ✅ | 浏览器 Cookie 中的 Authorization token |
 | `Username` | 可选 | 手机号，与 Password 配合使用可自动登录 |
 | `Password` | 可选 | 登录密码，配合 Username 使用 |
-| `RootID` | 可选 | 自定义根目录 ID，默认使用网盘根目录 |
-| `Type` | 可选 | 账号类型：`personal_new`（默认）/ `personal` / `family` / `group` / `share` |
-| `UserDomainID` | 可选 | 用户域 ID，自动登录后自动填充；提供后可查询空间 |
+| `RootFolderID` | 可选 | 自定义根目录 ID（`root_folder_id`），默认使用网盘根目录 |
+| `Type` | 可选 | 账号类型：`personal_new` / `personal` / `family` / `group` / `share`。省略时 SDK 自动填 `personal_new`（驱动结构体上的 `default:"personal_new"` 只是给 Web 表单看的提示，JSON 反序列化不会应用）；**写错拼写不会被纠正**，会报 `not implement` |
+| `UserDomainID` | 可选 | 用户域 ID（`user_domain_id`，浏览器 Cookie 里的 `ud_id`）。**不填则 `space` 无法使用**，驱动直接返回 `not implement` |
 | `MailCookies` | 可选 | 邮箱 Cookie，部分旧 API 需要 |
 | `LinkID` | 可选 | 分享链接 ID |
 | `CloudID` | 可选 | 群组 CloudID |
@@ -147,12 +155,12 @@ cloudfs --config /path/to/config.json ls /
   "storages": [
     {
       "mount_path": "/personal",
-      "driver": "yun139",
+      "driver": "139Yun",
       "addition": { "Authorization": "token-personal-..." }
     },
     {
       "mount_path": "/family",
-      "driver": "yun139",
+      "driver": "139Yun",
       "addition": { "Authorization": "token-family-...", "Type": "family" }
     }
   ],
@@ -219,7 +227,8 @@ func main() {
     client.Download(ctx, "/yun139/我的文件/photo.jpg", os.Stdout)
 
     // 上传
-    client.Upload(ctx, "/yun139/我的文件", "/tmp/photo.jpg")
+    // 上传；最后一个参数是进度回调，不需要就传 nil
+    client.Upload(ctx, "/yun139/我的文件", "/tmp/photo.jpg", nil)
 
     // 查看空间
     sp, _ := client.Space(ctx, "/yun139")

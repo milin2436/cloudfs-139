@@ -1,5 +1,8 @@
 # 编译产物
-cloudfs
+# ⚠️ 必须带前导 / 锚定到仓库根：裸写 `cloudfs` 会匹配任意层级的同名文件**和目录**，
+# 从而把源码目录 sdk/cloudfs/ 与 cmd/cloudfs/ 一起排除在版本控制之外。
+/cloudfs
+/cloudfs.exe
 *.exe
 *.test
 *.out

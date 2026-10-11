@@ -1,3 +1,8 @@
+//go:build go1.27
+
+// 该文件使用 Go 标准库 weak 包（weak.Pointer / weak.Make），仅 Go 1.27+ 可用。
+// 当前工具链为 go1.26.5，此处以 build tag 隔离；WeakCacheMap 全仓库无调用方，
+// 隔离后不影响任何现有功能。换回 Go 1.27+ 工具链后本文件自动参与编译。
 package cache
 
 import (
