@@ -15,7 +15,7 @@
     Go 1.27 才有的标准库 `weak` 包，因此用 `//go:build go1.27` 隔离（见 §4.7）
 - **来源**：从 [OpenList 4.2.5](https://github.com/OpenListTeam/OpenList) 移植
   - ⚠️ OpenList 源码目录 `/home/super/Downloads/code/OpenList-4.2.5` **已随磁盘损坏丢失**，
-    需要对照上游时请重新 clone
+    需要对照上游时请重新 clone（加新网盘的前置步骤见 §8）
   - 移植方式：将 OpenList 的 `internal/` 和 `drivers/base/` 复制到 `cloudfso/`，
     将所有 import 从 `github.com/OpenListTeam/OpenList/v4/...` 改为
     `github.com/milin2436/cloudfs-139/...`
@@ -713,7 +713,7 @@ go test -v -run TestResolvePath ./sdk/...   # 单个用例
 | GOPROXY | **必须** `https://goproxy.cn,direct`；默认的 proxy.golang.org 在本机 i/o timeout |
 | OS | Linux amd64 |
 | CGO | 无 gcc，SQLite 只能用纯 Go 的 glebarez 版本 |
-| 原始 OpenList | ❌ 已丢失（`/home/super/Downloads/code/OpenList-4.2.5`），需重新 clone |
+| 原始 OpenList | ❌ 已丢失（`/home/super/Downloads/code/OpenList-4.2.5`）。加新网盘前先下载 `v4.2.5` 到本机，流程见 §8 |
 | 测试配置 | ✅ `~/.cloudfs.json`（账号 `17144995673`，个人网盘）；旧的 `/tmp/139-personal-test.json` 已丢失 |
 
 ---
@@ -752,7 +752,33 @@ go test -v -run TestResolvePath ./sdk/...   # 单个用例
 
 ## 8. 扩展新驱动
 
-如果要在本项目中支持更多网盘（不止 139Yun），步骤：
+如果要在本项目中支持更多网盘（不止 139Yun），步骤如下。**第 0 步是硬前置**。
+
+### 0. 前置：先拿回 OpenList 4.2.5 源码
+
+⚠️ 当前本机**没有** OpenList 源码：`/home/super/Downloads/code/OpenList-4.2.5` 已随磁盘
+损坏丢失，Go 模块缓存里也没有。`cloudfso/` 是它的一次性拷贝，不能反过来当地图用 ——
+INDEX.md §12 的路径对照表只是索引，不是可编译代码。
+
+下载：
+
+```bash
+git clone --depth 1 --branch v4.2.5 https://github.com/OpenListTeam/OpenList.git
+# 放到本机任意路径，例如 /home/super/Downloads/code/OpenList-4.2.5
+```
+
+必须锁 `v4.2.5` 这个 tag：`cloudfso/` 是从它拷的，接口形状要对齐，否则 `op` 层的
+编译错误会看不出是指向新驱动还是指向框架漂移。
+
+两条纪律：
+
+- **不要放进本仓库目录**，也不要 `go get` 成依赖。它是抄写参照，不是 import 目标 ——
+  新驱动的代码里绝不能出现 `github.com/OpenListTeam/OpenList` 的 import。
+- **先补 `LICENSE` 再抄**。`cloudfso/` 本身是 OpenList（MIT）的派生，而仓库里现在
+  **没有** `LICENSE` 文件（README 第 4 行的 badge 链着它）。抄驱动代码之前得把授权
+  义务理清。
+
+### 1-7. 步骤
 
 1. 在 `drivers/` 下创建新目录，如 `drivers/aliyun/`
 2. 从 OpenList 对应 driver 目录复制 `meta.go / types.go / driver.go / util.go`
@@ -760,5 +786,33 @@ go test -v -run TestResolvePath ./sdk/...   # 单个用例
    - `github.com/OpenListTeam/OpenList/v4/internal/*` → `github.com/milin2436/cloudfs-139/cloudfso/*`
    - `github.com/OpenListTeam/OpenList/v4/drivers/base` → `github.com/milin2436/cloudfs-139/cloudfso/driver`
 4. `meta.go` 的 `driver.Config{Name: "..."}` 设置驱动名
-5. `init()` 中调用 `op.RegisterDriver()` 注册
-6. 运行 `go mod tidy && go build` 验证
+5. `init()` 中调用 `op.RegisterDriver()` 注册 —— 这是全仓库唯一的注册入口
+   （`cloudfso/op/driver.go:18` 定义，`drivers/yun139/meta.go:32` 是唯一调用点）
+6. 在 `sdk/cloudfs/client.go` 加一个 blank import 触发注册：
+   `_ "github.com/milin2436/cloudfs-139/drivers/aliyun"`。这个 blank import 是唯一让驱动
+   进入二进制的地方 —— 漏了就是"驱动文件在，命令里却找不到"。
+7. 运行 `go mod tidy && go build ./...` 验证
+
+### 最低实现面
+
+新驱动只需实现 `Meta` + `Reader`（`Init` / `Get` / `Content`）。SDK 的三个 139 特化能力
+都靠局部接口 + 类型断言做，不实现时行为已定死，不会 panic：
+
+| 入口 | 新驱动没实现时 |
+|------|----------------|
+| `Client.Space` | 照常工作，任何驱动都有 |
+| `cloudfs space` | 回落打印通用 total / used / free（字节），不出分项表 |
+| `Client.UserInfo` | error：`storage %q uses %s, which does not expose account info` |
+| `Client.Quota` | error：`storage %q uses %s, which does not report a per-drive-type quota` |
+| `Client.Share` 等 | error：`storage %q uses %s, which does not support sharing` |
+
+### 加第二个网盘前值得知道的框架缺口
+
+详见 INDEX.md §6.2、§8、§9：
+
+- **`archive/tool` 是死代码**：`RegisterTool` 有定义（`cloudfso/archive/tool/utils.go:12`）
+  但全仓库无调用方，zip/rar/7z 解压全部 `UnknownArchiveFormat`。单网盘时没人触发，
+  多网盘时变成公共缺口。
+- **六张多租户表没有使用者**（`user` / `meta` / `setting_item` / `search_node` /
+  `sharing` / `sshkey`），是 OpenList 残留。多账号多网盘场景要留还是删，先做决定。
+- **yun139 自身的 22 条已知缺陷**都是 139 专属，不会传染给新驱动。

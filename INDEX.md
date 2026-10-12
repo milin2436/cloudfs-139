@@ -939,7 +939,8 @@ func Truncate(ctx context.Context, storage driver.Driver, path string, size int6
 | `internal/archive/tool` | `cloudfso/archive/tool` |
 | `drivers/139` | `drivers/yun139` |
 
-> 需要新端点时，可先在 OpenList 源码（`/home/super/Downloads/code/OpenList-4.2.5`，见 DEV.md §6）找对应实现，复制后改写 import：`github.com/OpenListTeam/OpenList/v4/internal/*` → `github.com/milin2436/cloudfs-139/cloudfso/*`，`.../drivers/base` → `.../cloudfso/driver`。
+> 需要新端点或新网盘时，先在 OpenList 源码（`v4.2.5` tag；本机已丢失，需重新 clone，
+> 前置与步骤见 DEV.md §8）找对应实现，复制后改写 import：`github.com/OpenListTeam/OpenList/v4/internal/*` → `github.com/milin2436/cloudfs-139/cloudfso/*`，`.../drivers/base` → `.../cloudfso/driver`。
 
 **为什么是 `cloudfso/` 而不是 `internal/`**：Go 的 `internal` 包只能被同一 module root 下的包导入。把 OpenList 的 `internal/` 重新打包为**普通包** `cloudfso/`，SDK 和 CLI 才能自由 import。将来拆独立 module 时这一点仍然安全。
 
