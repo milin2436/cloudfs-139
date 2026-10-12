@@ -189,7 +189,7 @@ cloudfs --config /path/to/config.json ls /
 | `cloudfs whoami [mount]` | 查看账户信息 |
 | `cloudfs share <path> [--password] [--days N] [--name N] [--to p1,p2]` | 创建分享链接（**会把文件公开出去**） |
 | `cloudfs shares [--type sent\|received] [--json]` | 列出我发出的 / 收到的分享 |
-| `cloudfs unshare <linkID> [-f]` | 撤销分享（默认二次确认） |
+| `cloudfs unshare <linkID\|URL> [-f]` | 撤销分享（默认二次确认；也可直接粘整个分享链接） |
 | `cloudfs init [--driver X] [--write]` | 打印/写入示例配置 |
 
 全局选项：`-c, --config <path>` 指定配置文件路径（默认 `~/.cloudfs.json`）。
@@ -214,10 +214,13 @@ cloudfs share /yun139/相册 --json
 会在本地直接报错，不会打到服务端。
 
 ```bash
-cloudfs shares                      # 我发出的分享
+cloudfs shares                      # 我发出的分享（link 列打印完整 id，可直接复制）
 cloudfs shares --type received      # 别人发给我的
-cloudfs unshare 2ygb7jkiFM640       # 撤销（要输 y）
-cloudfs unshare 2ygb7jkiFM640 -f    # 跳过确认
+cloudfs shares --json               # 完整 JSON，含每个分享的 url
+cloudfs unshare A1b2C3d4E5f6G       # 撤销（要输 y）
+cloudfs unshare A1b2C3d4E5f6G -f    # 跳过确认
+# 直接粘整个链接也行，自动解析出 link id：
+cloudfs unshare "https://yun.139.com/shareweb/#/w/i/A1b2C3d4E5f6G" -f
 ```
 
 > **分享需要个人账号**。外链服务挂在 139 的 personalCloud 编排网关上，只有

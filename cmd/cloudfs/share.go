@@ -2,7 +2,9 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
+	"net/url"
 	"strings"
 
 	"github.com/spf13/cobra"
@@ -161,8 +163,11 @@ func newSharesCmd() *cobra.Command {
 			}
 			fmt.Fprintf(out, "%s: %d total, showing %d\n",
 				label, page.Count, len(page.Items))
-			fmt.Fprintf(out, "%-8s %-22s %-9s %-7s %-7s %-6s %s\n",
-				"link", "name", "code", "pub", "dl", "valid", "created")
+			// The link id is printed in full on purpose: it is the argument to
+			// "unshare". The name is the only column that gets truncated, since
+			// it is both the longest and the least useful for revoking.
+			fmt.Fprintf(out, "%-16s %-8s %-8s %-5s %-14s %-14s %s\n",
+				"link", "code", "pub", "dl", "expires", "created", "name")
 			for _, it := range page.Items {
 				pub := "public"
 				if it.FriendsOnly {
@@ -172,9 +177,9 @@ func newSharesCmd() *cobra.Command {
 				if it.Expires != "" {
 					expires = it.Expires
 				}
-				fmt.Fprintf(out, "%-8s %-22s %-9s %-7s %-7d %-6s %s\n",
-					truncate(it.LinkID, 8), truncate(it.Name, 22), orDash(it.Passwd),
-					pub, it.Downloads, expires, it.Created)
+				fmt.Fprintf(out, "%-16s %-8s %-8s %-5d %-14s %-14s %s\n",
+					it.LinkID, orDash(it.Passwd), pub, it.Downloads, expires,
+					it.Created, truncate(it.Name, 40))
 			}
 			return nil
 		},
@@ -193,11 +198,16 @@ func newUnshareCmd() *cobra.Command {
 		force bool
 	)
 	cmd := &cobra.Command{
-		Use:   "unshare <linkID> [--mount M]",
+		Use:   "unshare <linkID|shareURL> [--mount M]",
 		Short: "Revoke a share link you created",
-		Long: `Cancel one of your own share links by its link id. Use "cloudfs shares" to
-find the id. Only the link's creator can revoke it, and revoking it stops
-further downloads immediately.`,
+		Long: `Cancel one of your own share links. Only the link's creator can revoke it,
+and revoking it stops further downloads immediately.
+
+Pass either the link id from "cloudfs shares", or a whole share URL — the id
+is extracted from it, so pasting the link straight out of WeChat works:
+
+    cloudfs unshare A1b2C3d4E5f6G
+    cloudfs unshare "https://yun.139.com/shareweb/#/w/i/A1b2C3d4E5f6G" -f`,
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
@@ -205,14 +215,19 @@ further downloads immediately.`,
 			if err != nil {
 				return err
 			}
-			if !force && !confirm(fmt.Sprintf("revoke share %s? [y/N] ", args[0])) {
-				fmt.Fprintln(cmd.OutOrStdout(), "skipped")
-				return nil
-			}
-			if err := c.CancelShare(ctx, mount, args[0]); err != nil {
+			linkID, err := linkIDFromArg(args[0])
+			if err != nil {
 				return err
 			}
-			fmt.Fprintf(cmd.OutOrStdout(), "revoked share %s\n", args[0])
+			out := cmd.OutOrStdout()
+			if !force && !confirm(fmt.Sprintf("revoke share %s? [y/N] ", linkID)) {
+				fmt.Fprintln(out, "skipped")
+				return nil
+			}
+			if err := c.CancelShare(ctx, mount, linkID); err != nil {
+				return err
+			}
+			fmt.Fprintf(out, "revoked share %s\n", linkID)
 			return nil
 		},
 	}
@@ -241,6 +256,37 @@ func orDash(s string) string {
 		return "-"
 	}
 	return s
+}
+
+// linkIDFromArg takes either a bare link id or a whole share URL. Users only
+// ever see the URL in the wild, so unshare should not force them to fish the
+// id out of it by hand.
+func linkIDFromArg(s string) (string, error) {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return "", errors.New("link id is empty")
+	}
+	if !strings.Contains(s, "://") {
+		return s, nil
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return "", fmt.Errorf("not a valid share URL: %v", err)
+	}
+	// 139 puts the id in the fragment (/#/w/i/<id>), so prefer it over the
+	// path — otherwise "shareweb" would win.
+	for _, seg := range []string{u.Fragment, u.Path} {
+		last := ""
+		for _, part := range strings.Split(strings.Trim(seg, "/"), "/") {
+			if part != "" {
+				last = part
+			}
+		}
+		if last != "" {
+			return last, nil
+		}
+	}
+	return "", fmt.Errorf("no link id found in URL %q", s)
 }
 
 // truncate shortens to n runes so a table column stays put with CJK names.

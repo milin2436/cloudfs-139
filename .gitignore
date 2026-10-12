@@ -3,6 +3,9 @@
 # 从而把源码目录 sdk/cloudfs/ 与 cmd/cloudfs/ 一起排除在版本控制之外。
 /cloudfs
 /cloudfs.exe
+# `go build ./cmd/cloudfs/` 不带 -o 时，可执行文件就落在包目录里。
+# 同样不能写成 `*/cloudfs` 或 `**/cloudfs`（会把源码目录一起排除），只能写全路径。
+cmd/cloudfs/cloudfs
 *.exe
 *.test
 *.out
