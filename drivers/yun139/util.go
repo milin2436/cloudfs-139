@@ -1102,8 +1102,14 @@ func (d *Yun139) uploadPersonalParts(ctx context.Context, partInfos []PartInfo, 
 }
 
 func (d *Yun139) getDiskQuotaDetail(ctx context.Context) (*DiskQuotaDetail, error) {
-	data := map[string]interface{}{
-		"userDomainId": d.UserDomainID,
+	// The endpoint authenticates off the Authorization cookie, so userDomainId
+	// is optional: an empty body returns 0000 请求成功. Sending it blank is
+	// also accepted, but a non-empty wrong value is rejected with
+	// 01000001 参数错误 — so only ever put it in the body when we have a real
+	// one.
+	data := map[string]interface{}{}
+	if d.UserDomainID != "" {
+		data["userDomainId"] = d.UserDomainID
 	}
 	var resp DiskQuotaDetail
 	_, err := d.request("https://user-njs.yun.139.com/user/disk/quota/detail", http.MethodPost, func(req *resty.Request) {

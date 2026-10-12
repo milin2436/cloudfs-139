@@ -76,8 +76,12 @@ cloudfs init --driver yun139 --write
 > **如何获取 Authorization token**：在浏览器中登录 [yun.139.com](https://yun.139.com)，
 > 从 DevTools / Network 面板的 Cookie 中复制 `Authorization` 字段。
 >
+> 只填 `Authorization` 就能完成全部功能（含空间查询）。配额接口
+> `user-njs.yun.139.com/user/disk/quota/detail` 靠这个 cookie 鉴权，
+> body 传空对象 `{}` 即可，不需要 `user_domain_id`。
+>
 > 如果同时提供 `Username`（手机号）和 `Password`，工具会自动完成密码登录流程，
-> 获取完整 token 并设置 `UserDomainID`，从而解锁空间查询等高级功能。
+> 获取完整 token 并设置 `UserDomainID`。
 
 ### 3. 使用 CLI
 
@@ -144,7 +148,7 @@ cloudfs --config /path/to/config.json ls /
 | `Password` | 可选 | 登录密码，配合 Username 使用 |
 | `RootFolderID` | 可选 | 自定义根目录 ID（`root_folder_id`），默认使用网盘根目录 |
 | `Type` | 可选 | 账号类型：`personal_new` / `personal` / `family` / `group` / `share`。省略时 SDK 自动填 `personal_new`（驱动结构体上的 `default:"personal_new"` 只是给 Web 表单看的提示，JSON 反序列化不会应用）；**写错拼写不会被纠正**，会报 `not implement` |
-| `UserDomainID` | 可选 | 用户域 ID（`user_domain_id`，浏览器 Cookie 里的 `ud_id`）。**不填则 `space` 无法使用**，驱动直接返回 `not implement` |
+| `UserDomainID` | 可选 | 用户域 ID（`user_domain_id`，浏览器 Cookie 里的 `ud_id`）。配额接口不依赖它，**不填也能正常用 `space`**。若填写则必须真实有效 —— 传一个错误的值会收到 `01000001 参数错误`，比不填更糟 |
 | `MailCookies` | 可选 | 邮箱 Cookie，部分旧 API 需要 |
 | `LinkID` | 可选 | 分享链接 ID |
 | `CloudID` | 可选 | 群组 CloudID |
@@ -185,7 +189,7 @@ cloudfs --config /path/to/config.json ls /
 | `cloudfs mv <src> <dst-dir>` | 移动 |
 | `cloudfs cp <src> <dst-dir>` | 复制 |
 | `cloudfs rename <path> <new-name>` | 重命名 |
-| `cloudfs space [mount]` | 查看空间用量 |
+| `cloudfs space [mount]` | 查看空间用量（139Yun 按云盘类型分项，见下文 [空间](#空间)） |
 | `cloudfs whoami [mount]` | 查看账户信息 |
 | `cloudfs share <path> [--password] [--days N] [--name N] [--to p1,p2]` | 创建分享链接（**会把文件公开出去**） |
 | `cloudfs shares [--type sent\|received] [--json]` | 列出我发出的 / 收到的分享 |
@@ -229,6 +233,49 @@ cloudfs unshare "https://yun.139.com/shareweb/#/w/i/A1b2C3d4E5f6G" -f
 > 注意这和 `Type: "share"` 是两回事 —— 后者是"消费"别人发来的分享（走 AES 分享网关），
 > 前者是"自己创建"分享。
 
+### 空间
+
+`cloudfs space` 对 139Yun 打印的是 139 自己的配额报表（MB 原值 + GiB 折算列），
+并**按云盘类型分项**：
+
+```
+mount:  /yun139
+
+┌────────────────────────────┬──────────┬────────────┐
+│                            │    MB    │     ≈     │
+├────────────────────────────┼──────────┼────────────┤
+│ 总配额 diskSize            │   20,480 │     20 GiB │
+├────────────────────────────┼──────────┼────────────┤
+│ 个人云（我的文件）usedSize │  196,894 │  192.3 GiB │
+├────────────────────────────┼──────────┼────────────┤
+│ 家庭云usedSize             │   26,079 │   25.5 GiB │
+├────────────────────────────┼──────────┼────────────┤
+│ 共享群usedSize             │        0 │      0 GiB │
+├────────────────────────────┼──────────┼────────────┤
+│ 圈子usedSize               │        0 │      0 GiB │
+├────────────────────────────┼──────────┼────────────┤
+│ 笔记usedSize               │        0 │      0 GiB │
+├────────────────────────────┼──────────┼────────────┤
+│ 群组usedSize               │        0 │      0 GiB │
+├────────────────────────────┼──────────┼────────────┤
+│ 合计已用                   │  222,973 │  217.7 GiB │
+├────────────────────────────┼──────────┼────────────┤
+│ freeDiskSize               │ −202,493 │ −197.7 GiB │
+└────────────────────────────┴──────────┴────────────┘
+单位 MB（1 GiB = 1024 MB）；合计已用 = 总配额 − freeDiskSize，
+freeDiskSize 为负即已超额。139 没有按目录的配额。
+```
+
+几点值得注意：
+
+- **没有"某个目录还剩多少容量"这个概念**。139 前端的状态里只有账号级配额和
+  `quotaList`（按 driveType 分项），没有任何按路径聚合的字段，所以 `space`
+  不接受路径参数。
+- **分项之和可以超过总配额**。家庭云和个人云吃的是同一个池子，所以上面这个
+  20 GiB 的账号实际用了 217.7 GiB，`freeDiskSize` 是负的。上传被拒报的
+  `00010012 资源配额不足` 就是这种情况。
+- **`quotaList` 不做零值过滤**，六类云盘全部打印，表形状不会随账号变化而变。
+
 ---
 
 ## Go SDK 用法
@@ -269,9 +316,21 @@ func main() {
     // 上传；最后一个参数是进度回调，不需要就传 nil
     client.Upload(ctx, "/yun139/我的文件", "/tmp/photo.jpg", nil)
 
-    // 查看空间
+    // 查看空间（任意驱动的通用三数，字节）
     sp, _ := client.Space(ctx, "/yun139")
     fmt.Printf("Total: %d, Used: %d, Free: %d\n", sp.Total, sp.Used, sp.Free)
+
+    // 139 按云盘类型分项的配额（MB）。只有 139Yun 支持，其它驱动返回 error。
+    // 分项之和可能大于 DiskSizeMB：家庭云和个人云共用同一个池子。
+    q, err := client.Quota(ctx, "/yun139")
+    if err != nil {
+        panic(err)
+    }
+    fmt.Printf("配额 %d MB，已用 %d MB，剩余 %d MB\n",
+        q.DiskSizeMB, q.DiskSizeMB-q.FreeDiskSizeMB, q.FreeDiskSizeMB)
+    for _, it := range q.Items {
+        fmt.Printf("  %s: %d MB\n", it.Name, it.UsedMB)
+    }
 
     // 账户信息
     info, _ := client.UserInfo(ctx, "/yun139")

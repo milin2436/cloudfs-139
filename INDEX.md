@@ -2,9 +2,11 @@
 
 > 本文是**代码地图**：给"要在这个仓库里加一个功能"的人用的。
 > 使用者文档见 [README.md](README.md)，移植与踩坑史见 [DEV.md](DEV.md)。
-> 全文基于 2026-10-12 的 `main`，共 129 个 Go 文件。使用层（`sdk/` + `cmd/`）为
+> 全文基于 2026-10-12 的 `main`，共 131 个 Go 文件。使用层（`sdk/` + `cmd/`）为
 > 2026-10-12 重建 —— 原代码随磁盘损坏丢失，见 §0 与 DEV.md §1。
 > 2026-10-12 另加分享（外链）功能三层实现，见 §6.9 与 DEV.md §3.5 / §4.15。
+> 同日把 `space` 从"必须先有 `user_domain_id`"改成按云盘类型分项显示，
+> 并钉死配额 API 契约，见 §6.10 与 DEV.md §3.6 / §4.17。
 > 所有引用格式为 `文件:行号`，可直接跳转。
 
 ---
@@ -15,8 +17,8 @@
 
 | 曾经缺失 | 现在 |
 |---|---|
-| `sdk/cloudfs/`（SDK） | ✅ `doc.go` `json.go` `config.go` `types.go` `client.go` `userinfo.go` `share.go` + `config_test.go` `dsn_test.go` |
-| `cmd/cloudfs/`（CLI，14 个子命令） | ✅ `main.go` `cmds.go` `share.go` `util.go` |
+| `sdk/cloudfs/`（SDK） | ✅ `doc.go` `json.go` `config.go` `types.go` `client.go` `userinfo.go` `quota.go` `share.go` + `config_test.go` `dsn_test.go` |
+| `cmd/cloudfs/`（CLI，14 个子命令） | ✅ `main.go` `cmds.go` `quota.go` `share.go` `util.go` |
 | `db.Init` / `base.InitClient` 无调用方 | ✅ 由 `Client.onceInit` 调用 |
 | `cloudfso/op` 零调用方 | ✅ 全部 op 方法都有入口（除归档相关） |
 | `*_test.go` 数量为 0 | ✅ `config_test.go` 12 个 + `dsn_test.go` 1 个，共 13 个用例 |
@@ -34,7 +36,9 @@
    见 §6.9）。
    **上传被服务端以 `00010012 资源配额不足` 拒绝** —— 账号存储已满，
    请求体本身正确（`size`/`contentHash`/`parentFileId` 全部匹配本地文件），
-   所以是账号状态而非代码问题。`space` 需要 `user_domain_id`，见 DEV.md §3.3。
+   所以是账号状态而非代码问题。**已定位到具体数字**：20 GiB 配额，
+   个人云 196,894 MB + 家庭云 26,079 MB = 222,973 MB 已用，超额约 198 GiB
+   （见 §6.10）。`space` 已修复为不依赖 `user_domain_id`，实测可用。
    ⚠️ 因为上传不可用，分享的真机验证只能拿**空目录**做（新建 → 分享 → 撤销 → 删除），
    还没验证过"分享一个真实文件"和"分享一个非空目录"。
 2. **归档功能全部返回 `UnknownArchiveFormat`**。`archive/tool.RegisterTool` 全仓库
@@ -64,7 +68,7 @@
 ├────────────────────────────────────────────────────────────┤
 │  driver  driver.Driver = Meta + Reader（接口契约）          │  ← 契约层
 ├────────────────────────────────────────────────────────────┤
-│  drivers/yun139  Yun139（1167+1765+454+403+37 行）        │  ← 自研核心
+│  drivers/yun139  Yun139（1174+1771+465+403+37 行）        │  ← 自研核心
 │      5 种账号类型 × 9 个操作 × 10 个 HTTP 通道              │
 ├────────────────────────────────────────────────────────────┤
 │  base（resty） net（HTTP 服务/分片下载器） stream（流抽象）  │
@@ -86,9 +90,9 @@
 
 | 包 | 行数量级 | 职责 | 139 场景是否真用 |
 |---|---|---|---|
-| `sdk/cloudfs` | 1725 | 使用层 SDK：配置、路径解析、`Client.*` 包装（含 `share.go` 217 行分享） | ★★★ |
-| `cmd/cloudfs` | 766 | CLI：14 个子命令（含 `share.go` 256 行分享三件套） | ★★★ |
-| `drivers/yun139` | 3826 | 139 云盘驱动，5 账号类型 | ★★★ 核心 |
+| `sdk/cloudfs` | 1743 | 使用层 SDK：配置、路径解析、`Client.*` 包装（含 `share.go` 217 行分享、`quota.go` 96 行配额） | ★★★ |
+| `cmd/cloudfs` | 1053 | CLI：14 个子命令（含 `share.go` 302 行分享三件套、`quota.go` 191 行配额表格） | ★★★ |
+| `drivers/yun139` | 3850 | 139 云盘驱动，5 账号类型 | ★★★ 核心 |
 | `cloudfso/op` | ~4100 | 操作层 facade，SDK/CLI 唯一入口 | ★★★ |
 | `cloudfso/driver` | ~430 | Driver 接口契约 + Config + 进度/限速 | ★★★ |
 | `cloudfso/model` | ~3500 | Obj / Link / FileStreamer / Storage / User 等领域模型 | ★★★ |
@@ -298,14 +302,14 @@ drivers/yun139/meta.go:31  init() → op.RegisterDriver(func() driver.Driver { .
 
 ---
 
-## 6. 驱动核心：`drivers/yun139`（3826 行）
+## 6. 驱动核心：`drivers/yun139`（3850 行）
 
 | 文件 | 行 | 内容 |
 |---|---|---|
 | `meta.go` | 37 | `Addition` 结构体 + `driver.Config` + `init()` 注册 |
-| `types.go` | 454 | 所有 API 请求/响应结构体 + 5 个账号类型常量（:7-13） |
-| `driver.go` | 1167 | `Yun139` 结构体 + 全部 Driver 方法实现 |
-| `util.go` | 1765 | HTTP 通道 + 签名 + 加密 + 登录 + Token 刷新 |
+| `types.go` | 465 | 所有 API 请求/响应结构体 + 5 个账号类型常量（:7-13）+ `DiskQuotaDetail` |
+| `driver.go` | 1174 | `Yun139` 结构体 + 全部 Driver 方法实现 + `GetDiskQuota` |
+| `util.go` | 1771 | HTTP 通道 + 签名 + 加密 + 登录 + Token 刷新 + `getDiskQuotaDetail` |
 | `share.go` | 403 | 外链（outlink）分享：创建/列表/撤销 + `jsonInt64`。见 §6.9 |
 
 ### 6.1 `Addition` 配置（`meta.go:8-23`）
@@ -319,7 +323,7 @@ drivers/yun139/meta.go:31  init() → op.RegisterDriver(func() driver.Driver { .
 | `Type` | 否 | `personal_new,family,group,personal,share`，默认 `personal_new`。**全部业务分支的开关** |
 | `LinkID` | share 必填 | 多分享用 `,` `;` 换行分隔；`link_id#password` 表示带密码 |
 | `CloudID` | family/group 必填 | 上传时缺失直接报错（`driver.go:769-771`） |
-| `UserDomainID` | 否 | Cookie `ud_id`。**唯一的磁盘用量数据源**；为空则 `GetDetails` 返回 `errs.NotImplement`（`driver.go:1092`）。密码登录时 step3 自动写入 |
+| `UserDomainID` | 否 | Cookie `ud_id`。**配额查询不依赖它**（`GetDetails` 的空 body 就够用，见 §6.10）；但一旦填了就必须是真的，否则 `01000001 参数错误`。另一个用途是 family/group Copy 的 `commonAccountInfo.accountUserId`。密码登录时 step3 自动写入 |
 | `CustomUploadPartSize` | 否 | 0 = 自动（>30GB→512MB，否则 100MB，`driver.go:682`） |
 | `ReportRealSize` | 否 | 默认 true；false 时老上传链路报 `totalSize: 0` |
 | `UseLargeThumbnail` | 否 | 默认 false；true 优先取 `Style` 含 `Large` 的缩略图（`util.go:954`） |
@@ -348,8 +352,9 @@ drivers/yun139/meta.go:31  init() → op.RegisterDriver(func() driver.Driver { .
 | `Put` | 693 | `Put` |
 | `Other` | 1066 | `Other`（**仅 `video_preview`**） |
 | `GetDetails` | 1091 | `WithDetails` |
-| `GetUserInfo` | 1116 | **无任何框架接口对应** —— 只能被外部用类型断言直接调用 |
-| `fetchProfile` | 1135 | 私有 |
+| `GetDiskQuota` | 1116 | **无任何框架接口对应** —— 原始配额报表（含 `quotaList`），见 §6.10 |
+| `GetUserInfo` | 1125 | **无任何框架接口对应** —— 只能被外部用类型断言直接调用 |
+| `fetchProfile` | 1142 | 私有 |
 
 ❌ 未实现：`PutURL`、`GetRooter`、`Archive*`（三个）、`LinkCacheModeResolver`、`DirectUploader`、`MkdirResult`/`RenameResult`/`CopyResult`/`PutResult`（都是无 Result 的简化版）。
 
@@ -451,7 +456,10 @@ func (d *Yun139) groupGetLink(contentId string, path string) (string, error) {
 **cron 12h**（`driver.go:101-107`）：`cron.NewCron(time.Hour*12)` + `Do(refreshToken)`；`Drop`（:177-179）负责 `Stop()`。
 ⚠️ **只有 `d.ref == nil` 的主实例才创建 cron 并拉取路由策略**（`driver.go:47-109`）。因此被引用实例必须先于引用实例 Init，否则 `PersonalCloudHost` 为空、请求打到空 URL。
 
-**`UserDomainID` 的三个用途**：① `getDiskQuotaDetail`（`util.go:1104`）→ `/user/disk/quota/detail`，返回 MB 计的 `diskSize/freeDiskSize`；② family/group Copy 的 `commonAccountInfo.accountUserId`（`driver.go:582`、`util.go:1649`）；③ `GetUserInfo` 填充。
+**`UserDomainID` 的用途**（已收敛到一个）：family/group Copy 的
+`commonAccountInfo.accountUserId`（`driver.go:582`、`util.go:1649`）。配额查询
+**不需要它** —— `getDiskQuotaDetail`（`util.go:1104`）只在
+`d.UserDomainID != ""` 时才把它放进 body，空 body 也能取到配额，见 §6.10。
 
 **手机号解码**：`d.Account = splits[1]`（`util.go:96`），即 Authorization base64 后冒号分隔的第二段；`getAccount()`（:1012）统一提供并透明转发给 `ref`。
 
@@ -512,7 +520,59 @@ outlink 网关不带这个头就是明文 JSON —— **加这个头只会把简
 **使用层接入方式**：走"食谱 8 路径 2"（类型断言），本地接口
 `outlinkShareable` 定义在 `sdk/cloudfs/share.go:80`，和 `userinfo.go` 的
 `userInfoProvider` 完全同一个模式 —— 框架没有分享接口，所以只能断言，
-不能做成通用能力。
+不能做成通用能力。配额分项是同一个模式的第三个使用者，见 §6.10。
+
+### 6.10 配额（`quota/detail`）：`space` 的显示与契约
+
+`POST https://user-njs.yun.139.com/user/disk/quota/detail`，走 §6.5 的
+mcloud-sign 通道（`util.go` 的 `request()`）。**请求体可以为空**，鉴权只看
+Authorization cookie。
+
+| body | 结果 |
+|---|---|
+| `{}` | ✅ `0000 请求成功` |
+| `{"userDomainId":""}` | ✅ `0000` |
+| `{"account":"<手机号>"}` | ✅ `0000` |
+| `{"commonAccountInfo":{"account":"..."}}` | ✅ `0000` |
+| `{"userDomainId":"bogus"}` | ❌ `01000001 参数错误` |
+| `{"userDomainId":"bogus","commonAccountInfo":{...}}` | ❌ `01000001` |
+
+**单位是 MB（1024 KiB）**，用恒等式钉死：
+`diskSize - freeDiskSize == sum(usedSize)`，即
+`20480 - (-202493) == 196894 + 26079 == 222973`。`GetDetails` 乘的
+`utils.MB` 与此一致。
+
+**139 没有目录级配额。** 前端 60 个 bundle 里配额状态只有三处，全部不按路径：
+`userQuotaDetail{diskSize,freeDiskSize,quotaList[]}`、
+`userDiskInfo{diskSize,freeDiskSize,isInfiniteStorage}`、
+`familyCloudDiskInfo{usedSize,totalSize}`；页面唯一那条进度条就是
+`(diskSize-freeDiskSize)/diskSize*100`。所以"某个路径还剩多少容量"不存在，
+`space` 也不收路径参数。
+
+**分项 ≠ 分区。** 家庭云和个人云共用一个池子，`quotaList` 分项之和可以超过
+`diskSize`。本账号 20 GiB 配额、实际已用 222,973 MB ≈ 217.7 GiB，
+`freeDiskSize` 为负，超额约 198 GiB —— 这就是 §0 里那个
+`00010012 资源配额不足` 的原因。
+
+实现三层：
+
+| 层 | 位置 | 说明 |
+|---|---|---|
+| 驱动 | `util.go:1104` `getDiskQuotaDetail` | 只在 `UserDomainID != ""` 时才把 `userDomainId` 放进 body |
+| 驱动 | `driver.go:1091` `GetDetails` | 通用三数；**已删除** `UserDomainID == ""` 的前置 guard |
+| 驱动 | `driver.go:1116` `GetDiskQuota` | 导出，返回原始 `DiskQuotaDetail`（含 `quotaList`） |
+| 类型 | `types.go:391` / `types.go:401` | `DiskQuotaDetail` / `DiskQuotaItem`；`quotaList` 原先是被注释掉的 |
+| SDK | `quota.go:16` / `quota.go:56` | 本地接口 `diskQuotaGettable` + `Client.Quota`，单位保持 MB |
+| CLI | `cmd/cloudfs/quota.go:20` | `quotaTable`：box-drawing 表格，MB 千分位 + GiB 折算列 |
+| CLI | `cmd/cloudfs/quota.go:54` | `drawTable`：按显示宽度对齐，CJK 算 2 列（`isWide`） |
+
+`cmd/cloudfs/cmds.go` 的 `space` 优先取 `Quota()`，取不到才回落 `Space()` ——
+仓库目前只注册了 `yun139` 一个驱动（`drivers/yun139/meta.go:32`），所以回落
+分支实际不会触发，但留给了以后的驱动。
+
+顺带：`POST /user/status/query` 传 `{}` 会返回 `userDomainId`
+（本账号 `1256537756588849073`），所以这个值本身也能自动发现，
+目前还没做自动填充。踩坑细节见 DEV.md §3.6 / §4.17。
 
 ---
 
@@ -725,10 +785,11 @@ func Truncate(ctx context.Context, storage driver.Driver, path string, size int6
 
 1. **通用通道（零改动）**：`op.Other(ctx, storage, model.FsOtherArgs{Path, Method, Data})`（`fs.go:284`）→ `driver.Other`。yun139 已实现（`driver.go:1066`）。
 2. **类型安全通道**：`storage, actualPath, _ := op.GetStorageAndActualPath(path)` → `if x, ok := storage.(SomeIface); ok {...}`。与 op 层内部写法完全一致（`fs.go:288`、`:772`、`:783`）。
-   **仓库里已有两个使用者**：`sdk/cloudfs/userinfo.go`（账户信息，本地接口
-   `userInfoProvider`）和 `sdk/cloudfs/share.go`（分享，本地接口
-   `outlinkShareable`，见 §6.9）。**加一个不属于 op 层的能力（分享、搜索、回收站）
-   就用这条路** —— 别为了一个功能去改 `cloudfso/op` 的公共接口。
+   **仓库里已有三个使用者**：`sdk/cloudfs/userinfo.go`（账户信息，本地接口
+   `userInfoProvider`）、`sdk/cloudfs/share.go`（分享，本地接口
+   `outlinkShareable`，见 §6.9）、`sdk/cloudfs/quota.go`（配额分项，本地接口
+   `diskQuotaGettable`，见 §6.10）。**加一个不属于 op 层的能力（分享、搜索、
+   回收站）就用这条路** —— 别为了一个功能去改 `cloudfso/op` 的公共接口。
 3. **元信息暴露（不需要实例）**：`op.GetDriverInfoMap()` / `GetDriverNames()` / `GetDriver(name)`。
 
 ### 食谱 9 — 给下载加 Range / 断点续传
@@ -902,6 +963,17 @@ func Truncate(ctx context.Context, storage driver.Driver, path string, size int6
       DEV.md 的 Go 版本 / GOPROXY / OpenList 路径 / 测试配置 / init 流程
 - [x] 新增 DEV.md §4.12/§4.13/§4.14 三个坑（DSN、struct tag 缺省、`op.List` 无 Path），
       §5.2 端到端测试改写为真实账号流程
+- [x] 分享（外链）功能三层实现：`drivers/yun139/share.go` + `sdk/cloudfs/share.go` +
+      `cmd/cloudfs/share.go`，新增 `share` / `shares` / `unshare` 三个命令。真机验证：
+      自建空目录 → 分享（无码永久 / 加码 1 天）→ `shares` 列出 → `unshare` 撤销 → 删除。
+      见 §6.9 与 DEV.md §3.5 / §4.15
+- [x] 修 `.gitignore` 的裸 `cloudfs` 模式（它会把 `sdk/cloudfs/` 与 `cmd/cloudfs/`
+      整个排除在版本控制之外），并阻止编译产物 `cmd/cloudfs/cloudfs` 进仓库。见 DEV.md §4.11
+- [x] `space` 从"必须先有 `user_domain_id`"改成按云盘类型分项的表格显示：删掉
+      `GetDetails` 的前置 guard 和 SDK 里对应的兜底报错，新增 `GetDiskQuota` /
+      `Client.Quota` / `quotaTable`。同时钉死配额契约（空 body 即可、单位 MB、
+      没有目录级配额），并定位到上传被拒的原因 —— 本账号 20 GiB 配额已超额约 198 GiB。
+      见 §6.10 与 DEV.md §3.6 / §4.17
 
 ### 仍待办（按依赖顺序）
 
@@ -910,9 +982,9 @@ func Truncate(ctx context.Context, storage driver.Driver, path string, size int6
       `sqliteDSN` 落磁盘文件、`addition.type` 缺省导致 `NotImplement`、
       `toFile` 用 `o.GetPath()` 导致所有条目的 `path` 塌缩成挂载点
 - [ ] **上传与配额**：账号已满（`00010012 资源配额不足`），上传与整文件下载
-      尚无成功样本。腾出空间后补一次 `put` → `get` → sha256 比对
-- [ ] `space` 需 `user_domain_id`（Cookie 里的 `ud_id`），未提供时驱动返回
-      `not implement`，SDK 已把它转成可操作报错
+      尚无成功样本。超额程度已量化：20 GiB 配额、已用 222,973 MB ≈ 217.7 GiB
+      （个人云 192.3 GiB + 家庭云 25.5 GiB），`freeDiskSize` 为 −202,493 MB。
+      腾出空间后补一次 `put` → `get` → sha256 比对
 - [ ] 修 `util.go:914` 的 `panic(err)` → 返回 error（一次字段格式异常会崩掉整个进程）
 - [ ] 修 `util.go:1167` 全局 RedirectPolicy 污染（`defer` 恢复，或改局部 `resty.NewClient()`）
 - [ ] 给 `Yun139` 加 `sync.RWMutex` 保护 `Authorization` / `ref` / `cron`

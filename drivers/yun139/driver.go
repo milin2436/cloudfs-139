@@ -1089,15 +1089,17 @@ func (d *Yun139) Other(ctx context.Context, args model.OtherArgs) (interface{}, 
 }
 
 func (d *Yun139) GetDetails(ctx context.Context) (*model.StorageDetails, error) {
-	if d.UserDomainID == "" {
-		return nil, errs.NotImplement
-	}
+	// No UserDomainID guard here. An earlier revision refused to report quota
+	// without it, but the endpoint only needs the Authorization cookie, so the
+	// guard made "space" fail for everyone running with a bare cookie config.
 	detail, err := d.getDiskQuotaDetail(ctx)
 	if err != nil {
 		return nil, err
 	}
 
 	total := detail.Data.DiskSize * utils.MB
+	// FreeDiskSize is negative when the account is over quota, so Used stays
+	// correct either way.
 	used := (detail.Data.DiskSize - detail.Data.FreeDiskSize) * utils.MB
 
 	return &model.StorageDetails{
@@ -1108,9 +1110,16 @@ func (d *Yun139) GetDetails(ctx context.Context) (*model.StorageDetails, error) 
 	}, nil
 }
 
+// GetDiskQuota returns the raw quota report in MB, including the per-drive-type
+// breakdown that GetDetails discards. MB is 139's native unit here; the caller
+// multiplies by utils.MB to get bytes.
+func (d *Yun139) GetDiskQuota(ctx context.Context) (*DiskQuotaDetail, error) {
+	return d.getDiskQuotaDetail(ctx)
+}
+
 // GetUserInfo returns current-account info.
 // Account / UserDomainID / Username come from local state (always available).
-// TotalSpace / UsedSpace / FreeSpace come from the quota endpoint if UserDomainID is set.
+// TotalSpace / UsedSpace / FreeSpace come from the quota endpoint.
 // Nickname / IsVip / RawExtra come from the profile endpoint if it exists.
 // Never errors: missing info fields are just zero-valued.
 func (d *Yun139) GetUserInfo(ctx context.Context) (*UserInfo, error) {
@@ -1122,12 +1131,10 @@ func (d *Yun139) GetUserInfo(ctx context.Context) (*UserInfo, error) {
 	if err := d.fetchProfile(ctx, info); err != nil {
 		log.Debugf("139yun: profile endpoint not available: %v", err)
 	}
-	if d.UserDomainID != "" {
-		if q, err := d.getDiskQuotaDetail(ctx); err == nil {
-			info.TotalSpace = q.Data.DiskSize * utils.MB
-			info.FreeSpace = q.Data.FreeDiskSize * utils.MB
-			info.UsedSpace = info.TotalSpace - info.FreeSpace
-		}
+	if q, err := d.getDiskQuotaDetail(ctx); err == nil {
+		info.TotalSpace = q.Data.DiskSize * utils.MB
+		info.FreeSpace = q.Data.FreeDiskSize * utils.MB
+		info.UsedSpace = info.TotalSpace - info.FreeSpace
 	}
 	return info, nil
 }

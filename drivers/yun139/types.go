@@ -366,8 +366,7 @@ type RefreshTokenResp struct {
 
 // UserInfo holds current-account information returned by GetUserInfo.
 // Account / UserDomainID / Username are always populated from local state.
-// TotalSpace / UsedSpace / FreeSpace are filled from the quota endpoint
-// when UserDomainID is available.
+// TotalSpace / UsedSpace / FreeSpace are filled from the quota endpoint.
 // Nickname / IsVip / RawExtra come from the profile endpoint if it exists.
 type UserInfo struct {
 	Account      string                 `json:"account"`
@@ -381,17 +380,29 @@ type UserInfo struct {
 	RawExtra     map[string]interface{} `json:"extra,omitempty"`
 }
 
+// DiskQuotaDetail is POST /user/disk/quota/detail. All sizes are in MB
+// (1024 KiB), which the identity DiskSize - FreeDiskSize == sum(UsedSize)
+// confirms.
+//
+// QuotaList breaks the used space down by drive type. It is the closest 139
+// has to a per-scope number: there is no per-directory quota anywhere, and
+// family cloud draws on the same pool as personal cloud, so a 20 GiB account
+// can show 个人云 and 家庭云 usage adding up to far more than 20 GiB.
 type DiskQuotaDetail struct {
 	BaseResp
 	Data struct {
-		FreeDiskSize int64 `json:"freeDiskSize"`
-		DiskSize     int64 `json:"diskSize"`
-		// QuotaList    []struct {
-		// 	DriveType int    `json:"driveType"`
-		// 	DriveName string `json:"driveName"`
-		// 	UsedSize  int64  `json:"usedSize"`
-		// } `json:"quotaList"`
+		FreeDiskSize int64           `json:"freeDiskSize"`
+		DiskSize     int64           `json:"diskSize"`
+		QuotaList    []DiskQuotaItem `json:"quotaList"`
 	} `json:"data"`
+}
+
+// DiskQuotaItem is one drive type's share of the account's used space.
+type DiskQuotaItem struct {
+	// DriveType is 1 个人云, 2 家庭云, 3 共享群, 4 圈子, 8 笔记, 9 群组.
+	DriveType int    `json:"driveType"`
+	DriveName string `json:"driveName"`
+	UsedSize  int64  `json:"usedSize"`
 }
 
 type AndAlbumUploadResp struct {

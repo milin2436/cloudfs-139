@@ -25,10 +25,11 @@ import (
 	"github.com/milin2436/cloudfs-139/cloudfso/stream"
 	"github.com/milin2436/cloudfs-139/cloudfso/utils"
 
-	// Imports the 139Yun driver. The import registers it through
-	// op.RegisterDriver; the named reference is also used by Space to turn a
-	// quota refusal into an actionable error.
-	yun139 "github.com/milin2436/cloudfs-139/drivers/yun139"
+	// Imports the 139Yun driver, which registers itself through op.RegisterDriver
+	// in init(). Blank import on purpose: no SDK code names a type from it, so
+	// the driver-specific calls (userinfo.go, quota.go, share.go) each import it
+	// themselves.
+	_ "github.com/milin2436/cloudfs-139/drivers/yun139"
 )
 
 // sqliteDSN is an in-memory database that survives for the whole process.
@@ -594,7 +595,8 @@ func (c *Client) Rename(ctx context.Context, remotePath, newName string) error {
 }
 
 // Space returns the quota of a mount, or of default_mount when mountPath is
-// empty.
+// empty. Three numbers, in bytes, for any driver. For 139Yun's per-drive-type
+// breakdown use Quota instead.
 func (c *Client) Space(ctx context.Context, mountPath string) (*Space, error) {
 	if err := c.ensureInit(ctx); err != nil {
 		return nil, err
@@ -609,14 +611,6 @@ func (c *Client) Space(ctx context.Context, mountPath string) (*Space, error) {
 	}
 	details, err := op.GetStorageDetails(ctx, d)
 	if err != nil {
-		// 139Yun answers the quota query only when user_domain_id is set, and
-		// op turns its refusal into a bare "not implement" that tells the user
-		// nothing about what is actually missing.
-		if y, ok := d.(*yun139.Yun139); ok && y.UserDomainID == "" {
-			return nil, fmt.Errorf(
-				"storage %q: 139Yun reports no quota without user_domain_id in addition "+
-					"(the ud_id value from your yun.139.com cookie); %w", mount, err)
-		}
 		return nil, err
 	}
 	return &Space{

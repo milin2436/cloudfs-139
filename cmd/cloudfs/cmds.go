@@ -221,7 +221,15 @@ func newSpaceCmd() *cobra.Command {
 	cmd := &cobra.Command{
 		Use:   "space [mount]",
 		Short: "Show the quota of a mount (defaults to default_mount)",
-		Args:  atMost(1),
+		Long: `Show the quota of a mount.
+
+For 139Yun this prints 139's own quota report in MB with a GiB column, broken
+down by drive type (个人云 / 家庭云 / 共享群 / ...). Drive type is the finest
+scope 139 reports: there is no per-directory quota, so nothing here is keyed by
+a path. An account that is over quota shows a negative freeDiskSize.
+
+Other drivers fall back to plain total / used / free in bytes.`,
+		Args: atMost(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			ctx := cmd.Context()
 			c, err := newClient(ctx)
@@ -232,23 +240,52 @@ func newSpaceCmd() *cobra.Command {
 			if err != nil {
 				return err
 			}
-			sp, err := c.Space(ctx, mount)
-			if err != nil {
-				return err
-			}
 			out := cmd.OutOrStdout()
+
+			// Prefer 139's own report: it is the same single request Space()
+			// would make, and it also carries the per-drive-type breakdown.
+			// Drivers that do not implement it fall back to the plain numbers.
+			q, qerr := c.Quota(ctx, mount)
+			var total, used, free int64
+			if qerr == nil {
+				total, used, free = q.TotalBytes(), q.UsedBytes(), q.FreeBytes()
+			} else {
+				sp, err := c.Space(ctx, mount)
+				if err != nil {
+					return err
+				}
+				total, used, free = sp.Total, sp.Used, sp.Free
+			}
+
 			if asJSON {
-				data, err := json.Marshal(sp)
+				// Byte totals stay at the top level so an existing consumer of
+				// total / used / free keeps working; quota is additive.
+				env := struct {
+					Mount string         `json:"mount"`
+					Total int64          `json:"total"`
+					Used  int64          `json:"used"`
+					Free  int64          `json:"free"`
+					Quota *cloudfs.Quota `json:"quota,omitempty"`
+				}{Mount: mount, Total: total, Used: used, Free: free}
+				if qerr == nil {
+					env.Quota = q
+				}
+				data, err := json.Marshal(env)
 				if err != nil {
 					return err
 				}
 				fmt.Fprintln(out, string(data))
 				return nil
 			}
+
+			if qerr == nil {
+				fmt.Fprint(out, quotaTable(q, mount))
+				return nil
+			}
 			fmt.Fprintf(out, "mount: %s\n", mount)
-			fmt.Fprintf(out, "total: %s (%d bytes)\n", humanSize(sp.Total), sp.Total)
-			fmt.Fprintf(out, "used:  %s (%d bytes)\n", humanSize(sp.Used), sp.Used)
-			fmt.Fprintf(out, "free:  %s (%d bytes)\n", humanSize(sp.Free), sp.Free)
+			fmt.Fprintf(out, "total: %s (%d bytes)\n", humanSize(total), total)
+			fmt.Fprintf(out, "used:  %s (%d bytes)\n", humanSize(used), used)
+			fmt.Fprintf(out, "free:  %s (%d bytes)\n", humanSize(free), free)
 			return nil
 		},
 	}

@@ -174,7 +174,8 @@ SDK 用 `NormalizeDriverName` 把两种拼写都接受，因此旧配置不用�
    - 始终填充 `Account`（从 Authorization token 解码）
    - 始终填充 `Username`（来自 Addition）
    - 可选：尝试 `/hcy/user/getUserInfo` 端点获取 nickname / isVip
-   - 可选：如果有 `UserDomainID`，调用 `getDiskQuotaDetail` 获取配额
+   - 总是调用 `getDiskQuotaDetail` 获取配额（**不需要 `UserDomainID`**，
+     见 §4.17）
 
 **降级策略**：profile 端点 404 或 quota 失败都不会报错，只记录 debug 日志，
 返回已有的 account/username 字段。
@@ -219,6 +220,42 @@ SDK 用 `NormalizeDriverName` 把两种拼写都接受，因此旧配置不用�
 前端在 `da()` 里先 `getNewSign(...e.data...)`、之后拦截器才 `e.data = Dt(e.data)`。
 
 完整契约、验证过程与踩坑见 §4.15。
+
+### 3.6 配额（`space`）链路
+
+`POST https://user-njs.yun.139.com/user/disk/quota/detail`，和文件列表同一套
+mcloud-sign 传输（`util.go` 的 `request()`）。**请求体可以是空的**：`{}` 返回
+`0000 请求成功`，鉴权完全靠 Authorization cookie。
+
+| body | 结果 |
+|---|---|
+| `{}` | ✅ `0000 请求成功` |
+| `{"userDomainId":""}` | ✅ `0000` |
+| `{"account":"<手机号>"}` | ✅ `0000` |
+| `{"commonAccountInfo":{"account":"..."}}` | ✅ `0000` |
+| `{"userDomainId":"bogus"}` | ❌ `01000001 参数错误` |
+| `{"userDomainId":"bogus","commonAccountInfo":{...}}` | ❌ `01000001` |
+
+**单位是 MB（1024 KiB）**，用恒等式钉死：`diskSize - freeDiskSize == sum(usedSize)`，
+即 `20480 - (-202493) == 196894 + 26079 == 222973`。`GetDetails` 里乘的
+`utils.MB` 与此一致。
+
+139 的配额只有两种粒度：**账号级**（`diskSize` / `freeDiskSize`）和**按云盘类型**
+（`quotaList[]` 的 `driveType` / `driveName` / `usedSize`）。把前端 60 个 bundle
+翻了一遍，没有任何按目录聚合的配额字段 —— 页面唯一那条进度条就是
+`(diskSize - freeDiskSize) / diskSize * 100`。**所以不存在"某个路径的剩余容量"**，
+`space` 不接受路径参数。分项是 `quotaList`，家庭云和个人云吃同一个池子，
+分项之和完全可以超过 `diskSize`。
+
+调用链：`GetDiskQuota()`（驱动，导出）→ `sdk/cloudfs/quota.go` 的
+`diskQuotaGettable` 局部接口 + 类型断言（食谱 8 路径 2）→ `Client.Quota()` →
+`cmd/cloudfs/quota.go` 的 `quotaTable()`。之所以不走 `Space()`：
+`GetDetails` 返回的 `model.StorageDetails` 只有 `DiskUsage` 两个字段，
+`quotaList` 在那里被丢掉了，所以分项必须另开一条路取。
+
+顺带记一下：`POST /user/status/query` 传 `{}` 会直接返回 `userDomainId`
+（本账号 `1256537756588849073`）。也就是说这个值本身也能自动发现，
+不需要用户手填 —— 目前还没做自动填充。
 
 ---
 
@@ -552,6 +589,36 @@ SDK 里对应 `childPath()` + `toFile(mount, rel, o)`，回归测试 `TestToFile
 如果之后要再加一个类似的功能，调研阶段照写探针没问题，但**功能落地后记得删**，
 真机验证直接跑 CLI 就好（§5.2）。别为了留个"冒烟测试"而留一份平行实现。
 
+### 4.17 ⚠️ 配额接口**不需要** `user_domain_id`，别加本地前置校验
+
+早期版本 `GetDetails` 里有这一行：
+
+```go
+if d.UserDomainID == "" {
+    return nil, errs.NotImplement
+}
+```
+
+结果是只填了 Authorization 的账号 `cloudfs space` 直接失败，SDK 里还专门配了一段
+"reports no quota without user_domain_id in addition" 的友好报错去解释一个
+并不存在的前提。两处都已经删掉了。
+
+实测 `quota/detail` 空 body 就返回 `0000`，所以那个 guard 是**纯粹的误报**。
+**别把它加回来**，也别在别处再引入"必须先有 user_domain_id"这类前置条件 ——
+`README.md` 里"不填则 `space` 无法使用"的说法已经同步改了。
+
+真实约束只有一条：`userDomainId` 可以缺省或为空串，但**一旦给了就必须是真的**。
+传假值是 `01000001 参数错误`，比干脆不给更糟。所以 `getDiskQuotaDetail` 只在
+`d.UserDomainID != ""` 时才把它塞进 body。
+
+另外两个别踩：
+
+- `freeDiskSize` 在超额账号上是**负数**（本账号 `−202493` MB）。
+  `UsedSpace = (diskSize - freeDiskSize) * MB` 在超额时依然正确，
+  **不要**改成 `max(free, 0)` 之类的"修正"。
+- `quotaList` 分项之和可以超过 `diskSize`（家庭云和个人云共用一个池子）。
+  不要把分项和总量做一致性断言。
+
 ---
 
 ## 5. 构建与测试
@@ -584,9 +651,10 @@ go build -o /tmp/cloudfs ./cmd/cloudfs/
 ```
 
 已验证通过的操作（真实账号）：`whoami`、`ls`、`mkdir`、`mv`、`rename`、`cp`、
-`rm`、`Stat`、`Download`，以及分享全套：`share`（无码永久 / 加码 1 天，各一次）、
-`shares`（发出 + 收到）、`unshare`（含确认交互与 `-f`）。分享的验证走的是
-自建空目录 `cloudfs-share-probe` → 分享 → 撤销 → 删除，全程只暴露一个空目录。
+`rm`、`Stat`、`Download`、`space`（表格 + `--json`），以及分享全套：
+`share`（无码永久 / 加码 1 天，各一次）、`shares`（发出 + 收到）、`unshare`
+（含确认交互与 `-f`）。分享的验证走的是自建空目录 `cloudfs-share-probe` →
+分享 → 撤销 → 删除，全程只暴露一个空目录。
 
 **分享是唯一有外部影响的命令。** 生成出来的 URL 任何拿到它的人都能下载文件，
 所以测试时只拿自建目录做实验，创建后**立刻 `unshare`**，别留着。README 里也
@@ -595,11 +663,13 @@ go build -o /tmp/cloudfs ./cmd/cloudfs/
 三个坑，都是真机才暴露的：
 
 - **`addition.type` 不填会报 `not implement`**。见 §4.13，SDK 已补缺省。
-- **上传可能报 `00010012 资源配额不足`**。这是账号存储满了，不是代码问题。
-  判断方法：`-v` 看 `/hcy/file/create` 的请求体，`size` / `contentHash` /
-  `parentFileId` 都对就只是配额。
-- **`space` 必须配 `user_domain_id`**（Cookie 里的 `ud_id`），否则驱动返回
-  `not implement`。SDK 已转成可操作报错。
+- **上传报 `00010012 资源配额不足`**。账号真的满了，不是代码问题 —— 本账号
+  20 GiB 配额，个人云已用 192.3 GiB、家庭云 25.5 GiB，合计超额约 198 GiB，
+  `space` 打出来的 `freeDiskSize` 就是负数。判断方法：`-v` 看
+  `/hcy/file/create` 的请求体，`size` / `contentHash` / `parentFileId` 都对就
+  只是配额。
+- **`space` 不需要 `user_domain_id`**，旧文档说"必须配"是错的，见 §4.17。
+  空 body 就能取到配额，SDK 里那段对应的友好报错已删。
 
 `-v` 会把 Authorization token 以明文打进 debug 日志（驱动自己打的，
 `storage &{... Addition:{Authorization:*** 排查完关掉 `-v`，
